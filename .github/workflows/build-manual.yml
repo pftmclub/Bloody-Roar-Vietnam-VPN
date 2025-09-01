@@ -25,7 +25,7 @@ jobs:
       - name: Checkout awl-flutter code
         uses: actions/checkout@v4
         with:
-          repository: 'anywherelan/awl-flutter'
+          repository: 'pftmclub/awl-flutter'
           ref: ${{ github.event.inputs.awl_flutter_ref }}
           path: 'awl-flutter'
 
