@@ -11,8 +11,7 @@ Hướng dẫn sử dụng :
 
 Bước 1: Đầu tiên tải file từ trang release về:
 
-[https://github.com/pftmclub/Bloody-Roar-Vietnam-VPN/releases/download/1.0/awl-tray-windows-amd64-v0.12.0-4-g40403395.zip](https://github.com/pftmclub/Bloody-Roar-Vietnam-VPN/releases/download/1.0/awl-tray-windows-amd64-v0.12.0-4-g40403395.zip)
-
+[https://github.com/pftmclub/Bloody-Roar-Vietnam-VPN/releases/download/1.0/awl-tray-windows-amd64-95b36969.zip](https://github.com/pftmclub/Bloody-Roar-Vietnam-VPN/releases/download/1.0/awl-tray-windows-amd64-95b36969.zip)
 <br>
 
 Sau đó chuột phải vào file ``awl-tray-windows-amd64-v0.12.0.zip`` để giải nén như trong ảnh  : <br>
