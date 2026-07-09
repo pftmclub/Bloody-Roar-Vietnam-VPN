@@ -200,6 +200,17 @@ func (p *P2p) InitHost(hostConfig HostConfig) (host.Host, error) {
 	return p2pHost, nil
 }
 
+// buildTransportOpts wires the socket-marking controlFunc into every place
+// libp2p lets us: TCP dials (WithDialerForAddr) and UDP listen sockets
+// (quicreuse.OverrideListenUDP — QUIC dials share the listen socket).
+//
+// TODO(gateway): the TCP *listener* is NOT covered — go-libp2p's TCP
+// transport has no listen hook (Listen goes straight to manet.Listen), so
+// sockets accepted from it stay unmarked on every platform. With gateway
+// client mode on, their replies are routed into the TUN and inbound direct
+// TCP degrades (no leak; QUIC/dials/hole-punch/relay still work). Fixing it
+// needs an upstream listen hook + marking the listener (accepted sockets
+// inherit SO_MARK on Linux / listener options on Windows) — separate task
 func (p *P2p) buildTransportOpts(controlFunc func(network, address string, c syscall.RawConn) error) []libp2p.Option {
 	if controlFunc == nil {
 		return []libp2p.Option{

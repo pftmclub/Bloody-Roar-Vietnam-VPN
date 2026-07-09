@@ -2,7 +2,10 @@
 
 package sockmark
 
-import "syscall"
+import (
+	"context"
+	"syscall"
+)
 
 type noopMarker struct{}
 
@@ -12,6 +15,8 @@ type noopMarker struct{}
 func New() Marker { return noopMarker{} }
 
 func (noopMarker) FWMark() uint32 { return 0 }
+
+func (noopMarker) Start(_ context.Context) error { return nil }
 
 func (noopMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	return nil

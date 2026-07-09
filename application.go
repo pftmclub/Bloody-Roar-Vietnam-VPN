@@ -113,6 +113,12 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 	if a.SockMarker == nil {
 		a.SockMarker = sockmark.New()
 	}
+	// Start before InitHost so the very first libp2p sockets are already
+	// marked (on Windows: bound to the detected uplink). An offline start is
+	// not an error — see Marker.Start; only hard failures abort Init.
+	if err := a.SockMarker.Start(a.ctx); err != nil {
+		return fmt.Errorf("start socket marker: %v", err)
+	}
 	a.P2p = p2p.NewP2p(a.ctx)
 	p2pHost, err := a.P2p.InitHost(a.makeP2pHostConfig())
 	if err != nil {

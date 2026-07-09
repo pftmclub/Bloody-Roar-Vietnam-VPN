@@ -13,19 +13,8 @@ import (
 
 const awlForwardChain = "AWL-FORWARD"
 
-// privateSubnets is the destination set we refuse to forward from the gateway,
-// so the exit node's LAN, link-local, and CGNAT space stay invisible to
-// clients. awlSubnet itself is contained in 10.0.0.0/8 in practice, so
-// awl↔awl forward through the gateway is also dropped here — by design:
-// peers reach each other directly via libp2p, not via routed IP through an
-// exit node.
-var privateSubnets = []string{
-	"10.0.0.0/8",
-	"172.16.0.0/12",
-	"192.168.0.0/16",
-	"100.64.0.0/10",  // RFC 6598 — CGNAT
-	"169.254.0.0/16", // RFC 3927 — link-local
-}
+// privateSubnets (the destination set we refuse to forward) is shared across
+// platforms — see private_subnets.go.
 
 // NATState holds the state needed to teardown NAT rules.
 //

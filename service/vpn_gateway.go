@@ -83,18 +83,11 @@ func NewVPNGateway(conf *config.Config, tunnel *Tunnel, device *vpn.Device, p2p 
 	}
 }
 
-// VPNGatewayClientSupported reports whether client-side VPN gateway mode can
-// run on this OS/build. Linux has the full implementation; Android can run as
-// a client but only via the Android host's VpnService.Builder, so runtime API
-// changes only mutate the persisted config and take effect on next startup
-// (see EnableClient / DisableClient).
+// VPNGatewayClientSupported reports whether client-side VPN gateway mode can run on this OS/build.
 func VPNGatewayClientSupported() error {
 	switch runtime.GOOS {
-	case "linux", "android":
+	case "linux", "android", "windows":
 		return nil
-	case "windows":
-		return fmt.Errorf("VPN gateway client mode is not yet supported on Windows; " +
-			"see vpn/sockmark/sockmark_windows.go for outstanding work")
 	case "darwin":
 		return fmt.Errorf("VPN gateway client mode is not yet supported on macOS")
 	default:
@@ -103,22 +96,26 @@ func VPNGatewayClientSupported() error {
 }
 
 // VPNGatewayServerSupported reports whether server-side VPN gateway mode can
-// run on this OS/build. Currently only Linux: Android exit-node support
-// requires root or special system config, macOS lacks NAT/route glue, and the
-// Windows path (vpn/routes/nat_windows.go) is not yet safe to enable.
+// run on this OS/build. Linux (iptables NAT) and Windows (WFP + WinNAT);
+// Android exit-node support requires root or special system config, macOS
+// lacks NAT/route glue.
 func VPNGatewayServerSupported() error {
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux", "windows":
 		return nil
+	default:
+		return fmt.Errorf("VPN gateway server mode is not supported on %s", runtime.GOOS)
 	}
-	return fmt.Errorf("VPN gateway server mode is not supported on %s", runtime.GOOS)
 }
 
-// VPNGatewaySupported reports whether the full VPN gateway feature set (both
-// client and server) can run on this OS/build. Equivalent to
-// VPNGatewayServerSupported — server is the strictly stronger requirement.
-// Kept as a convenience for callers (awl-tray menu construction) that gate the
-// whole feature UI on full support.
+// VPNGatewaySupported reports whether any part of the VPN gateway feature set
+// (client or server) can run on this OS/build. Callers that need a specific
+// side must use VPNGatewayClientSupported / VPNGatewayServerSupported — the
+// tray menu already gates client and server entries separately.
 func VPNGatewaySupported() error {
+	if VPNGatewayClientSupported() == nil || VPNGatewayServerSupported() == nil {
+		return nil
+	}
 	return VPNGatewayServerSupported()
 }
 
@@ -393,9 +390,24 @@ func (g *VPNGateway) applyClient() error {
 		return nil
 	}
 
+	// TODO: Temporary exception rather than a restructure: this branching moves into
+	//  the netstate manager in the next MR and flattens there.
+	//nolint:nestif
 	if g.disableOSSetup {
 		g.clientRouteState = &routes.RouteState{}
 	} else {
+		// Markers that can be temporarily unable to guarantee loop-free
+		// marking (Windows: no uplink detected right now) expose Ready.
+		// The condition is self-healing — the marker re-binds sockets when
+		// connectivity appears — so this is "try again once online", not a
+		// permanent failure. Other platforms don't implement the interface
+		// and skip the check.
+		if readier, ok := g.sockMarker.(interface{ Ready() error }); ok {
+			if err := readier.Ready(); err != nil {
+				return fmt.Errorf("cannot enable VPN gateway: %w", err)
+			}
+		}
+
 		tunName, err := g.device.InterfaceName()
 		if err != nil {
 			return fmt.Errorf("get TUN name for gateway routes: %w", err)

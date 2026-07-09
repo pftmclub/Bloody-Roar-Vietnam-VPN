@@ -47,7 +47,8 @@ const TestTUNBatchSize = 100
 // QUIC reuse goroutines hanging past the goleak window.
 type noopSockMarker struct{}
 
-func (noopSockMarker) FWMark() uint32 { return 0 }
+func (noopSockMarker) FWMark() uint32                { return 0 }
+func (noopSockMarker) Start(_ context.Context) error { return nil }
 func (noopSockMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	return nil
 }

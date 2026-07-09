@@ -46,6 +46,22 @@ jobs:
         run: |
           go test -c -tags vpn_hostnet -o gw-hostnet.test ./vpn/routes/
           sudo ./gw-hostnet.test -test.run '^TestGatewayHostNet' -test.v
+      - name: VPN gateway host-network integration test (Windows, admin)
+        # Windows counterpart of the step above: exercises WinNAT + WFP +
+        # per-interface forwarding (SetupNAT/TeardownNAT) against a real NIC
+        # and the /1 client routes against a real Wintun adapter. GitHub
+        # Windows runners execute as Administrator, so no sudo equivalent is
+        # needed. The diagnostic Get-NetNat shows what the runner image holds
+        # in WinNAT (a Docker/HNS instance would conflict — decide about
+        # pre-cleaning based on what this prints).
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Get-NetNat | Format-List
+          go test -c -tags vpn_hostnet -o gw-hostnet.test.exe ./vpn/routes/
+          # Flags are quoted: pwsh splits an unquoted `-test.run` at the dot
+          # into `-test` + `.run`, which the test binary rejects.
+          ./gw-hostnet.test.exe '-test.run' '^TestGatewayHostNet' '-test.v'
       - name: Build cmd/awl
         run: go build github.com/anywherelan/awl/cmd/awl
       - name: Upload cmd/awl build
@@ -143,7 +159,6 @@ jobs:
 
           # Probe the egress IP via https://ifconfig.me
           curl4() { curl -4 -s --max-time 20 --retry 3 --retry-delay 2 https://ifconfig.me/; }
-
           IP_DIRECT=$(curl4); echo "egress IP (direct): $IP_DIRECT"
 
           ./awl cli gateway client use --name awl-tester
@@ -209,11 +224,101 @@ jobs:
           sleep 10
           awl_pid=`jobs -l | grep './awl' | awk '{print $2}'`
           ./awl.exe cli peers status
+
           ./librespeed-cli.exe --local-json config_librespeed.json --server 2 --json --share --telemetry-level disabled | python3 -m json.tool
 
           ping -w 20000 -n 10 10.66.0.2
           ping -w 20000 -n 10 -a awl-tester.awl
 
+          # ---- VPN gateway server (exit-node) mode: runtime enable/disable round-trips OS state ----
+          # Diagnostic first: what the runner already holds in WinNAT (a
+          # Docker/HNS instance here would explain a New-NetNat conflict).
+          powershell -NoProfile -Command 'Get-NetNat | Format-List'
+          ./awl.exe cli gateway server enable
+          powershell -NoProfile -Command 'if (-not (Get-NetNat -Name awl-gateway -ErrorAction SilentlyContinue)) { exit 1 }'
+          # WinNAT must not break p2p traffic inside the TUN
+          ping -w 20000 -n 4 10.66.0.2
+          ./awl.exe cli gateway server disable
+          powershell -NoProfile -Command 'if (Get-NetNat -Name awl-gateway -ErrorAction SilentlyContinue) { exit 1 }'
+
+          # ---- VPN gateway full-tunnel e2e: client = this runner, exit node = awl-tester ----
+          # Requires awl-tester to permit this CI peer as an exit node
+          # (WeAllowUsingAsExitNode) — the Windows CI peer id differs from the
+          # Linux one.
+          for i in $(seq 1 15); do
+            if ./awl.exe cli gateway list | grep -E 'awl-tester.*\[connected\]'; then break; fi
+            sleep 2
+          done
+          ./awl.exe cli gateway list | grep -E 'awl-tester.*\[connected\]'   # fail if never became available
+
+          curl4() { curl -4 -s --max-time 20 --retry 3 --retry-delay 2 https://ifconfig.me/; }
+          IP_DIRECT=$(curl4); echo "egress IP (direct): $IP_DIRECT"
+
+          # NRPT diagnostics before enable (split-DNS rules for the awl zone)
+          powershell -NoProfile -Command 'Get-DnsClientNrptPolicy | Format-List Namespace,NameServers'
+
+          ./awl.exe cli gateway client use --name awl-tester
+          ./awl.exe cli gateway status
+          ROUTES_ON=$(powershell -NoProfile -Command '(Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1 -ErrorAction SilentlyContinue | Measure-Object).Count' | tr -d '\r')
+          NRPT_ON=$(powershell -NoProfile -Command '(Get-DnsClientNrptPolicy | Where-Object { $_.Namespace -eq "." } | Measure-Object).Count' | tr -d '\r')
+          powershell -NoProfile -Command 'Get-DnsClientNrptPolicy | Format-List Namespace,NameServers'
+          # Route diagnostics incl. lifetimes/protocol: a route created without
+          # InitializeIpForwardEntry shows zero lifetimes and is ignored by the
+          # forwarding path while still being listed here.
+          powershell -NoProfile -Command 'Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1,::/1,8000::/1 -ErrorAction SilentlyContinue | Format-List DestinationPrefix,InterfaceAlias,RouteMetric,Protocol,ValidLifetime,PreferredLifetime'
+          # Tolerate a failed curl here so we always reach `client stop` below
+          # (a broken tunnel must not leave the runner black-holed); the
+          # `test -n "$IP_GW"` assertion after teardown turns it into a clean failure.
+          IP_GW=$(curl4 || true); echo "egress IP (via gateway): $IP_GW"
+
+          ./awl.exe cli gateway client stop
+          ROUTES_OFF=$(powershell -NoProfile -Command '(Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1 -ErrorAction SilentlyContinue | Measure-Object).Count' | tr -d '\r')
+          NRPT_OFF=$(powershell -NoProfile -Command '(Get-DnsClientNrptPolicy | Where-Object { $_.Namespace -eq "." } | Measure-Object).Count' | tr -d '\r')
+          IP_REVERTED=$(curl4); echo "egress IP (reverted): $IP_REVERTED"
+
+          # Assertions run with the gateway already disabled, so a failure here
+          # can't leave the runner's egress black-holed. Values are echoed
+          # first so a failed assertion is attributable from the log alone.
+          echo "ROUTES_ON=$ROUTES_ON NRPT_ON=$NRPT_ON ROUTES_OFF=$ROUTES_OFF NRPT_OFF=$NRPT_OFF"
+          test "$ROUTES_ON" -eq 2                            # /1 pair installed while gateway is on
+          test "$NRPT_ON" -ge 1                              # full-capture NRPT rule while gateway is on
+          test -n "$IP_GW"                                   # traffic really flowed through the exit node
+          test "$IP_GW" != "$IP_DIRECT"                      # egress changed => full-tunnel works
+          test "$IP_REVERTED" = "$IP_DIRECT"                 # runtime disable reverted egress
+          test "$ROUTES_OFF" -eq 0                           # /1 routes removed on disable
+          test "$NRPT_OFF" -eq 0                             # full-capture NRPT rule removed on disable
+
+          # Re-enable the gateway and hard-kill awl. A graceful-shutdown test is
+          # not possible here: Git-Bash `kill -SIGINT` cannot deliver a console
+          # ctrl event to a native Windows process on a console-less CI runner
+          # (verified: awl kept logging after the kill). Graceful teardown is
+          # already covered by the `client stop` assertions above and by the
+          # Linux branch; what a hard kill lets us assert is the documented
+          # CRASH semantics instead.
+          ./awl.exe cli gateway client use --name awl-tester
           sleep 1
-          kill -SIGINT $awl_pid
-          sleep 1
+          taskkill //F //IM awl.exe
+
+          # Crash fail-open: the /1 routes (v4 + v6 fence) are bound to the
+          # Wintun LUID and must disappear together with the adapter. Driver
+          # cleanup after a hard kill is asynchronous — poll.
+          DANGLING=-1
+          for i in $(seq 1 30); do
+            DANGLING=$(powershell -NoProfile -Command '(Get-NetRoute -DestinationPrefix 0.0.0.0/1,128.0.0.0/1,::/1,8000::/1 -ErrorAction SilentlyContinue | Measure-Object).Count' | tr -d '\r')
+            if [ "$DANGLING" -eq 0 ]; then break; fi
+            sleep 1
+          done
+          echo "DANGLING=$DANGLING"
+          test "$DANGLING" -eq 0
+
+          # The NRPT catch-all rule lives in the registry and must SURVIVE a
+          # hard kill — that's the documented crash behaviour (the next awl
+          # start reconfigures DNS and cleans it up).
+          NRPT_CRASH=$(powershell -NoProfile -Command '(Get-DnsClientNrptPolicy | Where-Object { $_.Namespace -eq "." } | Measure-Object).Count' | tr -d '\r')
+          echo "NRPT_CRASH=$NRPT_CRASH"
+          test "$NRPT_CRASH" -ge 1
+
+          # Runner hygiene: with awl dead, the leftover catch-all rule points
+          # all DNS at a resolver that no longer exists — remove it so the
+          # runner's post-job steps keep working DNS.
+          powershell -NoProfile -Command 'Get-DnsClientNrptRule | Where-Object { $_.Namespace -eq "." } | Remove-DnsClientNrptRule -Force'

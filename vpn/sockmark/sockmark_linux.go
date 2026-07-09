@@ -3,6 +3,7 @@
 package sockmark
 
 import (
+	"context"
 	"fmt"
 	"syscall"
 )
@@ -23,6 +24,10 @@ func New() Marker {
 }
 
 func (linuxMarker) FWMark() uint32 { return fwMark }
+
+// Start is a no-op: SO_MARK is interpreted by the kernel per packet, there is
+// no per-socket state to keep in sync with the network.
+func (linuxMarker) Start(_ context.Context) error { return nil }
 
 func (linuxMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	return func(_, _ string, c syscall.RawConn) error {

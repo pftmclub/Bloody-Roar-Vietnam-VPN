@@ -33,6 +33,14 @@ type Server struct {
 // no matching fwmark ip-rule, so the kernel ignores the mark — mirroring how
 // libp2p sockets are marked at all times (see application.go).
 // A nil dialControl yields a plain context-aware dialer.
+//
+// TODO(socks5-udp): UDP ASSOCIATE is effectively unsupported today (we serve
+// only libp2p streams via ServeConn; haxii's UDP relay starts only inside
+// Serve(), and BindIP is a fake 127.0.0.1). If it is ever enabled, note that
+// haxii creates its UDP sockets directly (net.ListenUDP / net.DialUDP in
+// udp.go) — bypassing config.Dial and therefore this marking, on every
+// platform. Those sockets would need their own dialControl-style hook,
+// otherwise UDP relay traffic loops into the VPN gateway tunnel.
 func NewServer(dialControl func(network, address string, c syscall.RawConn) error) *Server {
 	rule := NewUpdatableRule(NewRuleDenyLocalhost())
 	dialer := &net.Dialer{Control: dialControl}

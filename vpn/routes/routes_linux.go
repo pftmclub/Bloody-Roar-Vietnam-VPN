@@ -121,6 +121,11 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 		return nil, fmt.Errorf("get default routes: %w", err)
 	}
 	if len(origDefaults) == 0 {
+		// TODO(gateway-offline-start): soften to a warning and proceed with an
+		// empty exemption table — the route monitor below already re-syncs it
+		// when a default appears (DHCP), so an offline boot with a persisted
+		// ClientEnabled would self-heal instead of failing Init. Needs a
+		// reconcile-from-empty verification + doc updates
 		return nil, fmt.Errorf("no IPv4 default route present, cannot configure VPN gateway")
 	}
 

@@ -3,6 +3,7 @@
 package sockmark
 
 import (
+	"context"
 	"fmt"
 	"syscall"
 
@@ -40,6 +41,10 @@ func NewAndroid(protect ProtectFunc) *AndroidMarker {
 func New() Marker { return NewAndroid(nil) }
 
 func (m *AndroidMarker) FWMark() uint32 { return 0 }
+
+// Start is a no-op: socket protection is delegated to the host's
+// VpnService.protect, which owns its own network tracking.
+func (m *AndroidMarker) Start(_ context.Context) error { return nil }
 
 func (m *AndroidMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	if m.protect == nil {
