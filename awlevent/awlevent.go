@@ -18,6 +18,16 @@ type ReceivedAuthRequest struct {
 	PeerID string
 }
 
+// VPNGatewayConnectivityChanged is emitted (client mode only) when the
+// connection to the configured VPN gateway peer goes up or down, so the UI /
+// tray can reflect gateway reachability immediately instead of waiting for the
+// next GatewayInfo poll. GatewayInfo.Connected stays the canonical state; this
+// event is a low-latency edge signal, deduplicated to fire only on transitions.
+type VPNGatewayConnectivityChanged struct {
+	Connected bool
+	PeerID    string
+}
+
 func WrapSubscriptionToCallback(ctx context.Context, callback func(interface{}), bus Bus,
 	eventType interface{}, opts ...event.SubscriptionOpt) {
 	sub, err := bus.Subscribe(eventType, opts...)
