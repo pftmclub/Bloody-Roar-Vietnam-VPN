@@ -135,7 +135,7 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 		}
 		a.logger.Infof("VPN interface created. Name: %s CIDR: %s", interfaceName, &net.IPNet{IP: localIP, Mask: netMask})
 
-		a.Tunnel = service.NewTunnel(a.P2p, a.vpnDevice, a.Conf)
+		a.Tunnel = service.NewTunnel(a.P2p, a.vpnDevice, a.Conf, a.Eventbus)
 		go a.vpnDevice.ReadTUNPackets(a.Tunnel.HandleReadPackets)
 	}
 

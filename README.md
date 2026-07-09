@@ -259,8 +259,6 @@ On macOS and Windows awl currently refuses to start with VPN gateway enabled.
 > - **Dual-stack (IPv4 + IPv6):** everything automatically uses IPv4 through the tunnel.
 > - **IPv6-only network:** you'll have no internet connectivity until you turn the gateway off.
 
-> **Linux: host network changes mid-session aren't tracked.** If the host switches network (new Wi-Fi, Ethernet or cellular connection) while the gateway is on, restart awl. This will be fixed in a future release.
-
 ### Serve as an exit node
 
 This lets your other devices route their internet traffic out through this one. It is **off by default** — see [Why serving as an exit node is opt-in](#why-serving-as-an-exit-node-is-opt-in) below. Two things need to be set: turn the gateway service on, then allow each specific device to use it. Serving as an exit node is Linux-only (see the status table above).

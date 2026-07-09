@@ -40,9 +40,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+	"go.uber.org/goleak"
 
 	"github.com/anywherelan/awl/vpn/sockmark"
 )
@@ -58,6 +60,7 @@ func testFWMark() uint32 { return sockmark.New().FWMark() }
 // ---- N1: NAT apply/teardown lifecycle ----
 
 func TestGatewayHostNetNATLifecycle(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	setupDummyTun(t)
 	origForward := captureForward(t)
@@ -84,6 +87,7 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 // succeeds and the resulting state is identical to a single clean setup.
 
 func TestGatewayHostNetNATIdempotentResetup(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	setupDummyTun(t)
 	captureForward(t)
@@ -109,6 +113,7 @@ func TestGatewayHostNetNATIdempotentResetup(t *testing.T) {
 // ---- N3: NAT leaves a pre-existing ip_forward=1 untouched ----
 
 func TestGatewayHostNetNATPreservesExistingIPForward(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	setupDummyTun(t)
 	captureForward(t)
@@ -129,6 +134,7 @@ func TestGatewayHostNetNATPreservesExistingIPForward(t *testing.T) {
 // ---- R1: route apply/teardown lifecycle ----
 
 func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	requireDefaultRoute(t)
 	setupDummyTun(t)
@@ -152,15 +158,22 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 // and succeed without an EEXIST on the new TUN default.
 
 func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	requireDefaultRoute(t)
 	setupDummyTun(t)
 
 	before := snapshotNet(t)
 
-	_, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state1, err := SetupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err)
 	applied1 := snapshotNet(t)
+
+	// Simulate the crash: the first run's monitor goroutine would die with its
+	// process. Stop just the monitor (no OS teardown — the routes/rule/table are
+	// left orphaned on purpose for cleanupStaleRoutes to recover) before the
+	// recovery, so it neither leaks nor races the second setup.
+	state1.stopRouteMonitor()
 
 	// Simulate the TUN dying: deleting awl0 makes the kernel auto-remove the
 	// default route via it, leaving the fwmark rule + table copies orphaned.
@@ -183,6 +196,7 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 // duplicating or clobbering.
 
 func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
+	verifyNoLeaks(t)
 	requireRoot(t)
 	requireDefaultRoute(t)
 	setupDummyTun(t)
@@ -204,6 +218,109 @@ func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
 
 	require.NoError(t, netlink.RouteDel(leftover))
 	require.Equal(t, before, snapshotNet(t), "the failed setup must leave no partial state behind")
+}
+
+// ---- R4: route-change monitor keeps the exemption table in sync ----
+//
+// After setup, the monitor (netlink RTM_NEWROUTE/DELROUTE subscription) must
+// mirror host default-route changes into tableID so marked libp2p sockets keep
+// a physical-NIC exit across a DHCP renew / uplink roam. Here we simulate a new
+// uplink by adding a second default via a dummy interface into the main table,
+// then removing it, asserting the awl table follows both edges. It must never
+// disturb the TUN default route or the IPv6 fence.
+func TestGatewayHostNetRoutesStalenessReconcile(t *testing.T) {
+	verifyNoLeaks(t)
+	requireRoot(t)
+	requireDefaultRoute(t)
+	setupDummyTun(t)
+
+	state, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = TeardownGatewayRoutes(state) })
+
+	// A second dummy "uplink" with an on-link subnet and its own default route,
+	// at a high metric so it never competes with real egress or the TUN default.
+	const dummy2 = "awldummy2"
+	_ = exec.Command("ip", "link", "del", dummy2).Run() // best-effort pre-clean
+	mustCmd(t, "ip", "link", "add", dummy2, "type", "dummy")
+	mustCmd(t, "ip", "link", "set", dummy2, "up")
+	mustCmd(t, "ip", "addr", "add", "192.0.2.1/24", "dev", dummy2)
+	t.Cleanup(func() { _ = exec.Command("ip", "link", "del", dummy2).Run() })
+
+	mustCmd(t, "ip", "route", "add", "default", "via", "192.0.2.2", "dev", dummy2, "metric", "4000")
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(routeTableDump(t, tableID), "dev "+dummy2)
+	}, 5*time.Second, 100*time.Millisecond,
+		"the monitor must copy the new host default into the awl exemption table")
+
+	// The TUN default and IPv6 fence must be untouched by the reconcile.
+	assertRoutesApplied(t)
+
+	// Remove the second default; the awl table copy must follow.
+	mustCmd(t, "ip", "route", "del", "default", "via", "192.0.2.2", "dev", dummy2, "metric", "4000")
+
+	require.Eventually(t, func() bool {
+		return !strings.Contains(routeTableDump(t, tableID), "dev "+dummy2)
+	}, 5*time.Second, 100*time.Millisecond,
+		"the monitor must remove the stale default from the awl exemption table")
+
+	// The remove edge, like the add edge, must leave the TUN default and IPv6
+	// fence intact — reconcile only ever adjusts the exemption copies.
+	assertRoutesApplied(t)
+}
+
+// ---- R5: IPv6 route-change monitor keeps the exemption table in sync ----
+//
+// The IPv6 counterpart of R4. RA re-advertising a new router/prefix changes the
+// v6 default far more often than IPv4 changes, so the monitor must mirror v6
+// default changes into tableID too (marked libp2p v6 sockets otherwise fall
+// through to the `unreachable ::/0` fence and get EHOSTUNREACH). We simulate a
+// new v6 uplink with a high-metric default via a dummy interface and assert the
+// awl table follows both edges without disturbing the fence or the TUN default.
+func TestGatewayHostNetRoutesStalenessReconcileV6(t *testing.T) {
+	verifyNoLeaks(t)
+	requireRoot(t)
+	requireDefaultRoute(t)
+	// The v6 fence/exemption path (and thus v6 reconcile) only exists when the
+	// IPv6 stack is present; a kernel-level disable (ipv6.disable=1) removes it.
+	if _, err := os.Stat("/proc/sys/net/ipv6"); os.IsNotExist(err) {
+		t.Skip("no IPv6 stack on this host; the v6 exemption path is not installed")
+	}
+	setupDummyTun(t)
+
+	state, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = TeardownGatewayRoutes(state) })
+
+	// A second dummy "uplink" with an on-link v6 subnet and its own v6 default,
+	// at a high metric so it never competes with real egress or the fence.
+	const dummy2 = "awldummy2"
+	_ = exec.Command("ip", "link", "del", dummy2).Run() // best-effort pre-clean
+	mustCmd(t, "ip", "link", "add", dummy2, "type", "dummy")
+	mustCmd(t, "ip", "link", "set", dummy2, "up")
+	mustCmd(t, "ip", "addr", "add", "2001:db8::1/64", "dev", dummy2, "nodad")
+	t.Cleanup(func() { _ = exec.Command("ip", "link", "del", dummy2).Run() })
+
+	mustCmd(t, "ip", "-6", "route", "add", "default", "via", "2001:db8::2", "dev", dummy2, "metric", "4000")
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(route6TableDump(t, tableID), "dev "+dummy2)
+	}, 5*time.Second, 100*time.Millisecond,
+		"the monitor must copy the new host IPv6 default into the awl exemption table")
+
+	// The unreachable fence and TUN default must be untouched by the reconcile.
+	assertRoutesApplied(t)
+
+	// Remove the second v6 default; the awl table copy must follow.
+	mustCmd(t, "ip", "-6", "route", "del", "default", "via", "2001:db8::2", "dev", dummy2, "metric", "4000")
+
+	require.Eventually(t, func() bool {
+		return !strings.Contains(route6TableDump(t, tableID), "dev "+dummy2)
+	}, 5*time.Second, 100*time.Millisecond,
+		"the monitor must remove the stale IPv6 default from the awl exemption table")
+
+	assertRoutesApplied(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +432,19 @@ func stripVolatile(s string) string {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// verifyNoLeaks asserts the test spawns no goroutine that outlives it — chiefly
+// the route-change monitor and its netlink watcher goroutines, which
+// TeardownGatewayRoutes must reap. Registered via t.Cleanup (not defer) and as
+// the FIRST thing each test does, so — t.Cleanup being LIFO — it runs LAST,
+// after every teardown/link-delete cleanup, once nothing legitimate is left
+// running. IgnoreCurrent snapshots pre-existing background goroutines (logging
+// etc.) so only goroutines started by the test itself are held against it.
+func verifyNoLeaks(t *testing.T) {
+	t.Helper()
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() { goleak.VerifyNone(t, ignore) })
+}
 
 func requireRoot(t *testing.T) {
 	t.Helper()

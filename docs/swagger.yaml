@@ -270,7 +270,7 @@ definitions:
       gatewayPeerID:
         type: string
     required:
-      - gatewayPeerID
+    - gatewayPeerID
     type: object
   entity.FriendRequest:
     properties:
@@ -814,6 +814,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/api.Error'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.Error'
       summary: Remove known peer
       tags:
       - Peers
@@ -857,13 +861,13 @@ paths:
             $ref: '#/definitions/github_com_anywherelan_awl_config.Config'
       summary: Export server configuration
       tags:
-        - Settings
+      - Settings
   /settings/list_proxies:
     get:
       consumes:
-        - application/json
+      - application/json
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
@@ -885,20 +889,20 @@ paths:
             $ref: '#/definitions/entity.PeerInfo'
       summary: Get my peer info
       tags:
-        - Settings
+      - Settings
   /settings/set_proxy:
     post:
       consumes:
-        - application/json
+      - application/json
       parameters:
-        - description: Params
-          in: body
-          name: body
-          required: true
-          schema:
-            $ref: '#/definitions/entity.UpdateProxySettingsRequest'
+      - description: Params
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/entity.UpdateProxySettingsRequest'
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
@@ -927,40 +931,40 @@ paths:
   /vpn_gateway/client/disable:
     post:
       consumes:
-        - application/json
+      - application/json
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
       summary: Disable VPN gateway client mode
       tags:
-        - VPN Gateway
+      - VPN Gateway
   /vpn_gateway/client/enable:
     post:
       consumes:
-        - application/json
+      - application/json
       parameters:
-        - description: Params
-          in: body
-          name: body
-          required: true
-          schema:
-            $ref: '#/definitions/entity.EnableVPNGatewayClientRequest'
+      - description: Params
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/entity.EnableVPNGatewayClientRequest'
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
       summary: Enable VPN gateway client mode
       tags:
-        - VPN Gateway
+      - VPN Gateway
   /vpn_gateway/client/list_available:
     get:
       consumes:
-        - application/json
+      - application/json
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
@@ -968,24 +972,24 @@ paths:
             $ref: '#/definitions/entity.ListAvailableVPNGatewaysResponse'
       summary: List available VPN gateways
       tags:
-        - VPN Gateway
+      - VPN Gateway
   /vpn_gateway/server/set_enabled:
     post:
       consumes:
-        - application/json
+      - application/json
       parameters:
-        - description: Params
-          in: body
-          name: body
-          required: true
-          schema:
-            $ref: '#/definitions/entity.SetVPNGatewayServerEnabledRequest'
+      - description: Params
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/entity.SetVPNGatewayServerEnabledRequest'
       produces:
-        - application/json
+      - application/json
       responses:
         "200":
           description: OK
       summary: Toggle VPN gateway server mode
       tags:
-        - VPN Gateway
+      - VPN Gateway
 swagger: "2.0"

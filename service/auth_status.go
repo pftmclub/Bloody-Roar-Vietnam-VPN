@@ -180,6 +180,10 @@ func (s *AuthStatus) createPeerInfo(peer config.KnownPeer, myPeerName string, de
 // the peer is no longer known.
 func (s *AuthStatus) processPeerStatusInfo(peerID string, peerInfo protocol.PeerStatusInfo) {
 	if peerInfo.Declined {
+		// TODO: emit an awlevent (analogous to VPNGatewayConnectivityChanged) when
+		//  a peer explicitly declines us, so the UI can surface it immediately. The
+		//  peer stays in KnownPeers as not-confirmed (including if it was our VPN
+		//  gateway — we keep the binding even though it will no longer forward).
 		s.conf.UpdatePeerFields(peerID, func(peer *config.KnownPeer) {
 			peer.LastSeen = time.Now()
 			peer.Declined = true
@@ -305,11 +309,9 @@ func (s *AuthStatus) SendAuthRequest(ctx context.Context, peerID peer.ID, req pr
 		s.authsLock.Unlock()
 	}
 	if authResponse.Declined {
-		knownPeer, exists := s.conf.GetPeer(peerID.String())
-		if exists {
-			knownPeer.Declined = true
-			s.conf.UpsertPeer(knownPeer)
-		}
+		s.conf.UpdatePeerFields(peerID.String(), func(peer *config.KnownPeer) {
+			peer.Declined = true
+		})
 	}
 
 	s.logger.Infof("Successfully send auth to %s", peerID)
