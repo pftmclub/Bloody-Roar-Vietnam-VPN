@@ -1,6 +1,6 @@
 //go:build windows && vpn_hostnet
 
-// Package routes host-network integration tests, Windows edition.
+// Package netstate host-network integration tests, Windows edition.
 //
 // These tests exercise the real Windows plumbing (SetupNAT/TeardownNAT and
 // SetupGatewayRoutes/TeardownGatewayRoutes) against the *actual* host
@@ -18,7 +18,7 @@
 //
 // Run them via a compiled binary (mirrors the Linux hostnet suite):
 //
-//	go test -c -tags vpn_hostnet -o gw-hostnet.test.exe ./vpn/routes/
+//	go test -c -tags vpn_hostnet -o gw-hostnet.test.exe ./vpn/netstate/
 //	./gw-hostnet.test.exe -test.run '^TestGatewayHostNet' -test.v
 //
 // The server-side (NAT) tests use a real NIC of the host in place of the TUN:
@@ -31,14 +31,14 @@
 //
 // Deliberately NOT covered here (vs the Linux suite):
 //   - reaction to route changes (Linux R4/R5): on Windows that machinery is
-//     the sockmark watcher (UNICAST_IF re-bind), not a routes-package
-//     monitor — its integration test lands with the netstate refactoring,
-//     see TODO(netstate) in vpn/sockmark/sockmark_windows.go
+//     the sockmark watcher (UNICAST_IF re-bind), not a routes-side monitor —
+//     its integration test lands with the netstate manager refactoring,
+//     see TODO(netstate) in sockmark_windows.go
 //   - client-route stale recovery / leftover collisions (Linux R2/R3):
 //     impossible by design — the routes die with the adapter LUID
 //     (TestGatewayHostNetClientRoutesDieWithAdapter proves exactly that),
 //     and a fresh adapter is a fresh LUID.
-package routes
+package netstate
 
 import (
 	"fmt"
@@ -55,7 +55,6 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
 	"github.com/anywherelan/awl/embeds"
-	"github.com/anywherelan/awl/vpn/uplink"
 )
 
 const (
@@ -92,7 +91,7 @@ func requireAdmin(t *testing.T) {
 // NAT tests: the current uplink. Skips when the host is offline.
 func pickServerTestNIC(t *testing.T) (winipcfg.LUID, string) {
 	t.Helper()
-	route, ok, err := uplink.BestDefault(windows.AF_INET, 0)
+	route, ok, err := bestUplinkDefault(windows.AF_INET, 0)
 	require.NoError(t, err)
 	if !ok {
 		t.Skip("no IPv4 default route on this host; NAT hostnet tests need a live NIC")

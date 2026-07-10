@@ -1,6 +1,6 @@
 //go:build windows
 
-package routes
+package netstate
 
 import (
 	"errors"
@@ -12,8 +12,6 @@ import (
 	"github.com/tailscale/wf"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-
-	"github.com/anywherelan/awl/vpn/uplink"
 )
 
 const (
@@ -96,13 +94,13 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	// Fix is a route-change subscriber that re-syncs
 	// forwarding on the new uplink; lands with the netstate refactoring
 	forwardingTargets := []winipcfg.LUID{tunLUID}
-	uplinkRoute, ok, err := uplink.BestDefault(windows.AF_INET, tunLUID)
+	route, ok, err := bestUplinkDefault(windows.AF_INET, tunLUID)
 	if err != nil {
 		_ = TeardownNAT(state)
 		return nil, fmt.Errorf("detect uplink for forwarding: %w", err)
 	}
 	if ok {
-		forwardingTargets = append(forwardingTargets, winipcfg.LUID(uplinkRoute.IfLUID))
+		forwardingTargets = append(forwardingTargets, winipcfg.LUID(route.IfLUID))
 	} else {
 		logger.Warnf("no IPv4 default route found: enabling forwarding on TUN only, " +
 			"internet transit will not work until the gateway server is re-enabled with an active uplink")

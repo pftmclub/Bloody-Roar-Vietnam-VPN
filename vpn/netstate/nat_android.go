@@ -1,6 +1,6 @@
 //go:build linux && android
 
-package routes
+package netstate
 
 // NATState holds the state needed to teardown NAT rules.
 type NATState struct{}

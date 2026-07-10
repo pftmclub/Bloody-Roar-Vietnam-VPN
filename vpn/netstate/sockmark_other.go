@@ -1,6 +1,6 @@
 //go:build !linux && !windows
 
-package sockmark
+package netstate
 
 import (
 	"context"

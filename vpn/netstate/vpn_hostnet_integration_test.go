@@ -1,6 +1,6 @@
 //go:build linux && vpn_hostnet
 
-// Package routes host-network integration tests.
+// Package netstate host-network integration tests.
 //
 // These tests exercise the real Linux netfilter / netlink plumbing
 // (SetupNAT/TeardownNAT and SetupGatewayRoutes/TeardownGatewayRoutes) against
@@ -21,7 +21,7 @@
 //
 // Run them via a compiled binary so root never touches the Go build cache:
 //
-//	go test -c -tags vpn_hostnet -o gw-hostnet.test ./vpn/routes/
+//	go test -c -tags vpn_hostnet -o gw-hostnet.test ./vpn/netstate/
 //	sudo ./gw-hostnet.test -test.run '^TestGatewayHostNet' -test.v
 //
 // A dummy link (not a real TUN) is enough: the production code only references
@@ -29,7 +29,7 @@
 // difference — a real userspace TUN's routes self-destruct when the process
 // dies, a dummy's do not — is never relied upon here: we always either tear
 // down explicitly or delete the link to simulate that self-destruction.
-package routes
+package netstate
 
 import (
 	"fmt"
@@ -45,8 +45,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 	"go.uber.org/goleak"
-
-	"github.com/anywherelan/awl/vpn/sockmark"
 )
 
 const (
@@ -55,7 +53,7 @@ const (
 	ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
 )
 
-func testFWMark() uint32 { return sockmark.New().FWMark() }
+func testFWMark() uint32 { return New().FWMark() }
 
 // ---- N1: NAT apply/teardown lifecycle ----
 

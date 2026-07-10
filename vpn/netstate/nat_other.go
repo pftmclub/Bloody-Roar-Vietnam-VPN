@@ -1,6 +1,6 @@
 //go:build !linux && !windows
 
-package routes
+package netstate
 
 import "errors"
 

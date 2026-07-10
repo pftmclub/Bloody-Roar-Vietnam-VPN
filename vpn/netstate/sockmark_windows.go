@@ -1,6 +1,6 @@
 //go:build windows
 
-package sockmark
+package netstate
 
 import (
 	"context"
@@ -12,15 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ipfs/go-log/v2"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/uplink"
 )
-
-var logger = log.Logger("awl/sockmark")
 
 const (
 	// IP_UNICAST_IF / IPV6_UNICAST_IF socket-option ids (not exported by
@@ -311,13 +307,13 @@ func detectUplinkIndexes() (idx4, idx6 uint32) {
 		exclude = luid
 	}
 
-	route4, ok, err := uplink.BestDefault(windows.AF_INET, exclude)
+	route4, ok, err := bestUplinkDefault(windows.AF_INET, exclude)
 	if err != nil {
 		logger.Errorf("detect IPv4 uplink: %v", err)
 	} else if ok {
 		idx4 = route4.IfIndex
 	}
-	route6, ok, err := uplink.BestDefault(windows.AF_INET6, exclude)
+	route6, ok, err := bestUplinkDefault(windows.AF_INET6, exclude)
 	if err != nil {
 		logger.Errorf("detect IPv6 uplink: %v", err)
 	} else if ok {

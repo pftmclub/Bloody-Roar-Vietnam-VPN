@@ -1,6 +1,6 @@
 //go:build linux && android
 
-package routes
+package netstate
 
 // RouteState holds the state needed to teardown gateway routes.
 // On Android, routes are managed by VpnService.Builder, not from Go.

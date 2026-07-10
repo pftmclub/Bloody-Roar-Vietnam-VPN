@@ -1,6 +1,6 @@
 //go:build windows
 
-package routes
+package netstate
 
 import (
 	"errors"
@@ -37,7 +37,7 @@ type RouteState struct {
 // documented in GATEWAY_FEATURE.md).
 //
 // fwmark is unused on Windows — sockets are bound to the physical interface
-// via IP_UNICAST_IF; see vpn/sockmark/sockmark_windows.go.
+// via IP_UNICAST_IF; see sockmark_windows.go.
 func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 	luid, err := luidFromGUIDName(tunIfName)
 	if err != nil {

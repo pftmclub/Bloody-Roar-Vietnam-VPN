@@ -1,6 +1,6 @@
 //go:build linux && !android
 
-package routes
+package netstate
 
 import (
 	"errors"
@@ -18,13 +18,9 @@ import (
 const (
 	// tableID is the policy-routing table that holds the original main-table
 	// default route(s), so fwmark-tagged libp2p sockets can still reach the
-	// physical NIC while everything else is forced through the TUN.
-	//
-	// 0x61776C = "awl" in ASCII (lowercase). The sockmark package uses the
-	// same numeric value as the fwmark; the two live in different kernel
-	// namespaces and don't collide, but matching them makes awl-owned state
-	// trivially greppable in `ip rule` / `ip route show table`.
-	tableID = 0x61776C
+	// physical NIC while everything else is forced through the TUN. Same
+	// numeric value as the fwmark — see awlMark.
+	tableID = awlMark
 
 	// rulePriority places our fwmark→tableID rule before the main table
 	// (priority 32766). 32000 leaves room for wg-quick's conventional 32764

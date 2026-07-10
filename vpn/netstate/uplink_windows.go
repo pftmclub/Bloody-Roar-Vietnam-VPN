@@ -1,6 +1,6 @@
 //go:build windows
 
-package uplink
+package netstate
 
 import (
 	"fmt"
@@ -8,18 +8,18 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// BestDefault scans the live routing table for the given address family and
-// returns the uplink candidate per Best. excludeLUID is the adapter to skip
-// (our Wintun); pass 0 to exclude nothing. ok=false with err==nil means the
-// scan worked but no uplink exists right now (offline host) — callers treat
-// that as "index 0", not as a failure.
-func BestDefault(family winipcfg.AddressFamily, excludeLUID winipcfg.LUID) (Route, bool, error) {
+// bestUplinkDefault scans the live routing table for the given address family
+// and returns the uplink candidate per bestUplink. excludeLUID is the adapter
+// to skip (our Wintun); pass 0 to exclude nothing. ok=false with err==nil
+// means the scan worked but no uplink exists right now (offline host) —
+// callers treat that as "index 0", not as a failure.
+func bestUplinkDefault(family winipcfg.AddressFamily, excludeLUID winipcfg.LUID) (uplinkRoute, bool, error) {
 	rows, err := winipcfg.GetIPForwardTable2(family)
 	if err != nil {
-		return Route{}, false, fmt.Errorf("get IP forward table: %w", err)
+		return uplinkRoute{}, false, fmt.Errorf("get IP forward table: %w", err)
 	}
 
-	candidates := make([]Route, 0, 4)
+	candidates := make([]uplinkRoute, 0, 4)
 	for i := range rows {
 		r := &rows[i]
 		if r.DestinationPrefix.PrefixLength != 0 {
@@ -36,7 +36,7 @@ func BestDefault(family winipcfg.AddressFamily, excludeLUID winipcfg.LUID) (Rout
 		if err != nil {
 			continue
 		}
-		candidates = append(candidates, Route{
+		candidates = append(candidates, uplinkRoute{
 			IfLUID:  uint64(r.InterfaceLUID),
 			IfIndex: r.InterfaceIndex,
 			Metric:  r.Metric + ipIface.Metric,
@@ -44,6 +44,6 @@ func BestDefault(family winipcfg.AddressFamily, excludeLUID winipcfg.LUID) (Rout
 		})
 	}
 
-	best, ok := Best(candidates, uint64(excludeLUID))
+	best, ok := bestUplink(candidates, uint64(excludeLUID))
 	return best, ok, nil
 }

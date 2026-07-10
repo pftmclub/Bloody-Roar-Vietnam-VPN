@@ -1,6 +1,6 @@
 //go:build linux && !android
 
-package sockmark
+package netstate
 
 import (
 	"context"
@@ -10,10 +10,9 @@ import (
 
 // fwMark is the firewall mark applied to libp2p sockets to bypass the VPN
 // gateway. Used together with policy routing (ip rule) so that libp2p traffic
-// uses the physical interface instead of the TUN. 0x61776C = "awl" in ASCII;
-// the routes package uses the same numeric value as its routing table ID, so
-// awl-owned entries are easy to spot in `ip rule` / `ip route show table`.
-const fwMark uint32 = 0x61776C
+// uses the physical interface instead of the TUN. Same numeric value as the
+// policy-routing table ID — see awlMark.
+const fwMark uint32 = awlMark
 
 type linuxMarker struct{}
 

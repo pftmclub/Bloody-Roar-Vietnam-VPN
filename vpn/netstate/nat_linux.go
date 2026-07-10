@@ -1,6 +1,6 @@
 //go:build linux && !android
 
-package routes
+package netstate
 
 import (
 	"errors"

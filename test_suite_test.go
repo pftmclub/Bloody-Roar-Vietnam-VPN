@@ -41,7 +41,7 @@ import (
 
 const TestTUNBatchSize = 100
 
-// noopSockMarker is a sockmark.Marker test double that does nothing. Production
+// noopSockMarker is a netstate.Marker test double that does nothing. Production
 // wiring sets SocketControlFunc unconditionally; tests run as a non-root user
 // where SO_MARK fails with EPERM, which would break libp2p dials and leave
 // QUIC reuse goroutines hanging past the goleak window.

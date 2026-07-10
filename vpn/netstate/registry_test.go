@@ -1,4 +1,4 @@
-package sockmark
+package netstate
 
 import (
 	"errors"

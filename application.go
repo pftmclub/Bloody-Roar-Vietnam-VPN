@@ -39,7 +39,7 @@ import (
 	"github.com/anywherelan/awl/ringbuffer"
 	"github.com/anywherelan/awl/service"
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/sockmark"
+	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 const (
@@ -97,9 +97,9 @@ type Application struct {
 	// keep libp2p traffic out of the VPN tunnel when gateway mode is on.
 	// Callers (notably cmd/gomobile-lib on Android) may set this before
 	// Init to inject a platform-specific marker — e.g.
-	//   app.SockMarker = sockmark.NewAndroid(protectorFn)
-	// Init falls back to sockmark.New() if SockMarker is left nil.
-	SockMarker sockmark.Marker
+	//   app.SockMarker = netstate.NewAndroid(protectorFn)
+	// Init falls back to netstate.New() if SockMarker is left nil.
+	SockMarker netstate.Marker
 }
 
 func New() *Application {
@@ -111,7 +111,7 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 
 	a.ctx, a.ctxCancel = context.WithCancel(ctx)
 	if a.SockMarker == nil {
-		a.SockMarker = sockmark.New()
+		a.SockMarker = netstate.New()
 	}
 	// Start before InitHost so the very first libp2p sockets are already
 	// marked (on Windows: bound to the detected uplink). An offline start is

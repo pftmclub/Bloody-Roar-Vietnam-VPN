@@ -19,7 +19,7 @@ import (
 	"github.com/anywherelan/awl/metrics"
 	"github.com/anywherelan/awl/protocol"
 	"github.com/anywherelan/awl/socks5"
-	"github.com/anywherelan/awl/vpn/sockmark"
+	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 type SOCKS5 struct {
@@ -31,7 +31,7 @@ type SOCKS5 struct {
 	server *socks5.Server
 }
 
-func NewSOCKS5(p2pService P2p, conf *config.Config, sockMarker sockmark.Marker) (*SOCKS5, error) {
+func NewSOCKS5(p2pService P2p, conf *config.Config, sockMarker netstate.Marker) (*SOCKS5, error) {
 	logger := log.Logger("awl/service/socks5")
 
 	var client *socks5.Client

@@ -14,8 +14,7 @@ import (
 	"github.com/anywherelan/awl/config"
 	"github.com/anywherelan/awl/entity"
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/routes"
-	"github.com/anywherelan/awl/vpn/sockmark"
+	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 // DNSReconfigurer is the narrow slice of the DNS service the gateway needs to
@@ -49,7 +48,7 @@ type VPNGateway struct {
 	tunnel     *Tunnel
 	device     *vpn.Device
 	p2p        P2p
-	sockMarker sockmark.Marker
+	sockMarker netstate.Marker
 	dns        DNSReconfigurer
 	logger     *log.ZapEventLogger
 
@@ -63,14 +62,14 @@ type VPNGateway struct {
 	// paths. Connectivity to the bound gateway peer is observed via p2p
 	// events inside Tunnel — no background goroutine here.
 	mu               sync.Mutex
-	clientRouteState *routes.RouteState
-	serverNATState   *routes.NATState
+	clientRouteState *netstate.RouteState
+	serverNATState   *netstate.NATState
 }
 
 // NewVPNGateway constructs a VPNGateway service. tunnel may be nil when the
 // VPN interface is disabled; the API methods still work but only update the
 // persisted config.
-func NewVPNGateway(conf *config.Config, tunnel *Tunnel, device *vpn.Device, p2p P2p, sockMarker sockmark.Marker, dns DNSReconfigurer, disableOSSetup bool) *VPNGateway {
+func NewVPNGateway(conf *config.Config, tunnel *Tunnel, device *vpn.Device, p2p P2p, sockMarker netstate.Marker, dns DNSReconfigurer, disableOSSetup bool) *VPNGateway {
 	return &VPNGateway{
 		conf:           conf,
 		tunnel:         tunnel,
@@ -155,7 +154,7 @@ func (g *VPNGateway) ListAvailableVPNGateways() []entity.AvailableVPNGateway {
 // gateway, applying OS-level routes immediately. Atomic: rolls back the
 // tunnel binding on apply failure.
 //
-// On android the OS-level apply (routes.SetupGatewayRoutes / sockmark) is a
+// On android the OS-level apply (netstate.SetupGatewayRoutes / sockmark) is a
 // no-op — routing is owned by the host's VpnService.Builder. This call flips
 // the in-memory tunnel binding and persists config; the host then re-establishes
 // the VpnService with the new routes and hot-swaps the fresh tun fd into the
@@ -298,7 +297,7 @@ func (g *VPNGateway) IsServerActive() bool {
 // ClientRouteState returns the current route state pointer (or nil). For
 // tests that need pointer-identity comparisons (idempotent re-enable must
 // not reinstall routes).
-func (g *VPNGateway) ClientRouteState() *routes.RouteState {
+func (g *VPNGateway) ClientRouteState() *netstate.RouteState {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.clientRouteState
@@ -323,7 +322,7 @@ func (g *VPNGateway) applyServer() error {
 	if g.disableOSSetup {
 		// Keep state tracking working (so teardown is symmetric) without
 		// touching the kernel.
-		g.serverNATState = &routes.NATState{}
+		g.serverNATState = &netstate.NATState{}
 		return nil
 	}
 
@@ -334,7 +333,7 @@ func (g *VPNGateway) applyServer() error {
 	localIP, netMask := g.conf.VPNLocalIPMask()
 	awlSubnet := (&net.IPNet{IP: localIP.Mask(netMask), Mask: netMask}).String()
 
-	natState, err := routes.SetupNAT(awlSubnet, tunName)
+	natState, err := netstate.SetupNAT(awlSubnet, tunName)
 	if err != nil {
 		return fmt.Errorf("setup NAT: %w", err)
 	}
@@ -352,7 +351,7 @@ func (g *VPNGateway) teardownServer() {
 		return
 	}
 	if !g.disableOSSetup {
-		if err := routes.TeardownNAT(g.serverNATState); err != nil {
+		if err := netstate.TeardownNAT(g.serverNATState); err != nil {
 			g.logger.Errorf("teardown NAT: %v", err)
 		}
 	}
@@ -394,7 +393,7 @@ func (g *VPNGateway) applyClient() error {
 	//  the netstate manager in the next MR and flattens there.
 	//nolint:nestif
 	if g.disableOSSetup {
-		g.clientRouteState = &routes.RouteState{}
+		g.clientRouteState = &netstate.RouteState{}
 	} else {
 		// Markers that can be temporarily unable to guarantee loop-free
 		// marking (Windows: no uplink detected right now) expose Ready.
@@ -412,7 +411,7 @@ func (g *VPNGateway) applyClient() error {
 		if err != nil {
 			return fmt.Errorf("get TUN name for gateway routes: %w", err)
 		}
-		routeState, err := routes.SetupGatewayRoutes(tunName, g.sockMarker.FWMark())
+		routeState, err := netstate.SetupGatewayRoutes(tunName, g.sockMarker.FWMark())
 		if err != nil {
 			return fmt.Errorf("setup gateway routes: %w", err)
 		}
@@ -446,7 +445,7 @@ func (g *VPNGateway) teardownClient() {
 		return
 	}
 	if !g.disableOSSetup {
-		if err := routes.TeardownGatewayRoutes(g.clientRouteState); err != nil {
+		if err := netstate.TeardownGatewayRoutes(g.clientRouteState); err != nil {
 			g.logger.Errorf("teardown gateway routes: %v", err)
 		}
 	}

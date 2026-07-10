@@ -44,7 +44,7 @@ jobs:
         # `if: always()` cleanup step
         if: matrix.os == 'ubuntu-latest'
         run: |
-          go test -c -tags vpn_hostnet -o gw-hostnet.test ./vpn/routes/
+          go test -c -tags vpn_hostnet -o gw-hostnet.test ./vpn/netstate/
           sudo ./gw-hostnet.test -test.run '^TestGatewayHostNet' -test.v
       - name: VPN gateway host-network integration test (Windows, admin)
         # Windows counterpart of the step above: exercises WinNAT + WFP +
@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           Get-NetNat | Format-List
-          go test -c -tags vpn_hostnet -o gw-hostnet.test.exe ./vpn/routes/
+          go test -c -tags vpn_hostnet -o gw-hostnet.test.exe ./vpn/netstate/
           # Flags are quoted: pwsh splits an unquoted `-test.run` at the dot
           # into `-test` + `.run`, which the test binary rejects.
           ./gw-hostnet.test.exe '-test.run' '^TestGatewayHostNet' '-test.v'

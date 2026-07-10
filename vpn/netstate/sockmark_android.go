@@ -1,16 +1,12 @@
 //go:build linux && android
 
-package sockmark
+package netstate
 
 import (
 	"context"
 	"fmt"
 	"syscall"
-
-	"github.com/ipfs/go-log/v2"
 )
-
-var androidLogger = log.Logger("awl/sockmark")
 
 // ProtectFunc is the type of the callback supplied by the Android host
 // application (VpnService.protect via the gomobile/JNI bridge). Returns true
@@ -60,7 +56,7 @@ func (m *AndroidMarker) ControlFunc() func(network, address string, c syscall.Ra
 			// crashing the process.
 			defer func() {
 				if r := recover(); r != nil {
-					androidLogger.Warnf("VpnService.protect panicked for fd %d: %v", fd, r)
+					logger.Warnf("VpnService.protect panicked for fd %d: %v", fd, r)
 					sockErr = fmt.Errorf("VpnService.protect panic: %v", r)
 				}
 			}()
