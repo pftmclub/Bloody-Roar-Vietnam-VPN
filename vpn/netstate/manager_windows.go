@@ -55,8 +55,10 @@ func NewManager() *Manager {
 // start (no default route → both indexes 0) is not an error: the watcher
 // picks the uplink up when connectivity appears and re-binds registered
 // sockets, so a restart is never needed. Only the change-notification
-// registration itself can fail. Must be called before the first libp2p
-// socket is created.
+// registration itself can fail — and that deliberately fails Init (unlike
+// the Linux Start, whose netlink monitor is best-effort staleness tracking):
+// the notifications drive socket marking itself, which never recovers
+// without them. Must be called before the first libp2p socket is created.
 func (m *Manager) Start(ctx context.Context) error {
 	m.redetect()
 

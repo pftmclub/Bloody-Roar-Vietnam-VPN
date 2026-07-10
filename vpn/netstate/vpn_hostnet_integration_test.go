@@ -32,6 +32,7 @@
 package netstate
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -169,15 +170,12 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 
 	before := snapshotNet(t)
 
+	// No Start → no route monitor: mgr1 is abandoned with its OS state orphaned
+	// on purpose for cleanupStaleRoutes to recover, exactly like a process that
+	// died before teardown.
 	mgr1 := NewManager()
 	require.NoError(t, mgr1.EnableClientRoutes(testTunIf))
 	applied1 := snapshotNet(t)
-
-	// Simulate the crash: the first run's monitor goroutine would die with its
-	// process. Stop just the monitor (no OS teardown — the routes/rule/table are
-	// left orphaned on purpose for cleanupStaleRoutes to recover) before the
-	// recovery, so it neither leaks nor races the second setup.
-	mgr1.routeState.stopRouteMonitor()
 
 	// Simulate the TUN dying: deleting awl0 makes the kernel auto-remove the
 	// default route via it, leaving the fwmark rule + table copies orphaned.
@@ -241,7 +239,13 @@ func TestGatewayHostNetRoutesStalenessReconcile(t *testing.T) {
 	requireDefaultRoute(t)
 	setupDummyTun(t)
 
+	// The monitor lives in Manager.Start (not in EnableClientRoutes), so start
+	// it explicitly; cancel stops it before goleak's final check (VerifyNone's
+	// built-in retries absorb the asynchronous goroutine exit).
 	mgr := NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, mgr.Start(ctx))
 	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
 	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
 
@@ -296,7 +300,11 @@ func TestGatewayHostNetRoutesStalenessReconcileV6(t *testing.T) {
 	}
 	setupDummyTun(t)
 
+	// See R4 for why Start + cancel are needed here.
 	mgr := NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, mgr.Start(ctx))
 	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
 	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
 
@@ -441,12 +449,14 @@ func stripVolatile(s string) string {
 // ---------------------------------------------------------------------------
 
 // verifyNoLeaks asserts the test spawns no goroutine that outlives it — chiefly
-// the route-change monitor and its netlink watcher goroutines, which
-// teardownGatewayRoutes must reap. Registered via t.Cleanup (not defer) and as
-// the FIRST thing each test does, so — t.Cleanup being LIFO — it runs LAST,
-// after every teardown/link-delete cleanup, once nothing legitimate is left
-// running. IgnoreCurrent snapshots pre-existing background goroutines (logging
-// etc.) so only goroutines started by the test itself are held against it.
+// the route-change monitor and its netlink watcher goroutines, which die when
+// the ctx passed to Manager.Start is cancelled. Registered via t.Cleanup (not
+// defer) and as the FIRST thing each test does, so — t.Cleanup being LIFO — it
+// runs LAST, after every teardown/cancel/link-delete cleanup, once nothing
+// legitimate is left running (VerifyNone's built-in retries absorb the
+// asynchronous exit after cancel). IgnoreCurrent snapshots pre-existing
+// background goroutines (logging etc.) so only goroutines started by the test
+// itself are held against it.
 func verifyNoLeaks(t *testing.T) {
 	t.Helper()
 	ignore := goleak.IgnoreCurrent()

@@ -6,10 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
-	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -34,14 +31,13 @@ const (
 	tunRouteMetric = 5
 )
 
-// routeState holds the state needed to teardown gateway routes.
+// routeState holds the state needed to teardown gateway routes. Pure data with
+// no locking or lifecycle of its own: every field is guarded by Manager.mu —
+// written by setupGatewayRoutes, the origDefaults*/baselines rewritten by the
+// route-change monitor's reconcile when the host default changes mid-session
+// (see runRouteMonitor in manager_linux.go), read by teardownGatewayRoutes.
 type routeState struct {
 	tunLinkIndex int
-
-	// mu guards origDefaults / origDefaultsV6, which the route-change monitor
-	// rewrites when the host default changes mid-session (see runRouteMonitor).
-	// The remaining fields are set once during setup and never mutated.
-	mu sync.Mutex
 
 	// origDefaults are the IPv4 default routes copied into tableID as the marked
 	// libp2p exemption path. Seeded from the main table at setup and then kept in
@@ -60,17 +56,6 @@ type routeState struct {
 	origDefaultsV6 []netlink.Route
 	v6RuleAdded    bool
 	v6UnreachAdded bool
-
-	// Route-change monitor lifecycle. monitorDone is closed by
-	// teardownGatewayRoutes to stop the monitor; monitorWG waits for the
-	// goroutine to finish before teardown mutates tableID. Both are zero/nil when
-	// no monitor is running (e.g. a rollback before startRouteMonitor).
-	// stopping is set just before monitorDone is closed so the subscription's
-	// ErrorCallback can suppress the benign "Receive failed" that our own
-	// socket close provokes (netlink never closes the socket itself on error).
-	monitorDone chan struct{}
-	monitorWG   sync.WaitGroup
-	stopping    atomic.Bool
 }
 
 // setupGatewayRoutes configures the system to route all traffic through the
@@ -109,8 +94,9 @@ func (m *Manager) setupGatewayRoutes(tunIfName string) (*routeState, error) {
 	// re-advertising a new router/prefix — far more frequent), this copy would go
 	// stale and marked libp2p sockets would lose their physical-NIC exit. This is
 	// degraded p2p connectivity, never a leak — the catch-all TUN default / v6
-	// unreachable route is static. startRouteMonitor (called at the end of setup)
-	// subscribes to netlink route changes and re-syncs tableID for both families.
+	// unreachable route is static. The route-change monitor (alive since
+	// Manager.Start for the whole process, see runRouteMonitor) re-syncs tableID
+	// for both families once this state is published to m.routeState.
 	origDefaults, err := getDefaultRoutes()
 	if err != nil {
 		return nil, fmt.Errorf("get default routes: %w", err)
@@ -172,12 +158,6 @@ func (m *Manager) setupGatewayRoutes(tunIfName string) (*routeState, error) {
 		_ = m.teardownGatewayRoutes(state)
 		return nil, err
 	}
-
-	// Everything is in place: start tracking host default-route changes so the
-	// tableID exemption copies stay in sync with the live uplink. Started last so
-	// a rollback above never has to stop a monitor. A subscribe failure is
-	// non-fatal — the gateway still works, only staleness tracking is disabled.
-	state.startRouteMonitor()
 
 	return state, nil
 }
@@ -315,15 +295,14 @@ func cleanupStaleRoutes() bool {
 }
 
 // teardownGatewayRoutes reverses the changes made by setupGatewayRoutes.
+// Callers hold m.mu (DisableClientRoutes, and the rollbacks inside
+// setupGatewayRoutes via EnableClientRoutes), which is also what makes it
+// exclusive with the monitor's reconcile: reconcile either finished before we
+// took the lock, or will see m.routeState == nil after.
 func (m *Manager) teardownGatewayRoutes(state *routeState) error {
 	if state == nil {
 		return nil
 	}
-
-	// Stop the route-change monitor first and wait for it to exit, so it can't
-	// race with the tableID deletions below (it mutates the same table + the
-	// origDefaults slices). After this returns, we have exclusive access.
-	state.stopRouteMonitor()
 
 	var errs []error
 
@@ -508,181 +487,36 @@ func isIPv6DefaultDst(dst *net.IPNet) bool {
 	return bits == 0
 }
 
-// routeMonitorDebounce is the interval at which the monitor checks whether any
-// relevant route event has arrived since the last reconcile. A single uplink
-// change (DHCP renew, Wi-Fi roam, new RA) emits a burst of
-// RTM_NEWROUTE/RTM_DELROUTE messages; the monitor only marks state dirty as they
-// come in and reconciles at most once per tick, coalescing the burst into a
-// single reconcile (bounded worst-case latency of one interval).
-// Our reconcile is two netlink dumps + a small
-// diff with no external consumers, so a short interval is fine — and the window
-// it bounds is only degraded p2p, never a leak, so faster restoration is a mild
-// plus.
-const routeMonitorDebounce = 500 * time.Millisecond
-
-// routeMonitorResubscribeBackoff is how long the monitor waits before retrying a
-// netlink subscription that died mid-session (see runRouteMonitor).
-const routeMonitorResubscribeBackoff = 1 * time.Second
-
-// startRouteMonitor subscribes to kernel route changes and keeps the tableID
-// exemption copies in sync with the live host default(s). Best-effort: if the
-// netlink subscription can't be established the gateway still works, only
-// staleness tracking is disabled. Call exactly once, at the end of a successful
-// setupGatewayRoutes.
-func (s *routeState) startRouteMonitor() {
-	teardownDone := make(chan struct{})
-	subDone := make(chan struct{})
-	updates, err := s.subscribeRouteUpdates(subDone)
-	if err != nil {
-		// Initial subscription failed: give up (unlike a mid-session death, which
-		// runRouteMonitor retries). Best-effort — the gateway still works, only
-		// staleness tracking is disabled.
-		logger.Warnf("gateway route monitor: subscribe failed, route-staleness tracking disabled: %v", err)
-		return
-	}
-
-	s.monitorDone = teardownDone
-	s.monitorWG.Add(1)
-	go s.runRouteMonitor(updates, subDone, teardownDone)
-}
-
-// subscribeRouteUpdates opens a fresh netlink route-change subscription feeding a
-// new updates channel. Closing subDone tears down THIS subscription's socket and
-// its internal watcher goroutine — the library never closes the socket itself on
-// a receive error, so each subscription needs its own cancel channel to avoid
-// leaking a socket + goroutine per re-subscription. netlink closes the updates
-// channel on any receive error, which the consumer treats as "subscription died".
-// The ErrorCallback stays quiet once s.stopping is set: tearing our own socket
-// down provokes a benign "Receive failed" that is not worth logging.
-func (s *routeState) subscribeRouteUpdates(subDone <-chan struct{}) (chan netlink.RouteUpdate, error) {
-	updates := make(chan netlink.RouteUpdate, 64)
-	opts := netlink.RouteSubscribeOptions{
-		ListExisting: false,
-		ErrorCallback: func(err error) {
-			if s.stopping.Load() {
-				return
-			}
-			logger.Warnf("gateway route monitor: %v", err)
-		},
-	}
-	if err := netlink.RouteSubscribeWithOptions(updates, subDone, opts); err != nil {
-		return nil, err
-	}
-	return updates, nil
-}
-
-// stopRouteMonitor signals the monitor to stop and blocks until it has exited,
-// guaranteeing the caller exclusive access to the tableID state afterwards.
-// Idempotent and safe when no monitor is running.
-func (s *routeState) stopRouteMonitor() {
-	if s.monitorDone == nil {
-		return
-	}
-	// Set before closing so the ErrorCallback suppresses the benign "Receive
-	// failed" that runRouteMonitor's deferred close(subDone) will provoke.
-	s.stopping.Store(true)
-	close(s.monitorDone)
-	s.monitorWG.Wait()
-	s.monitorDone = nil
-}
-
-// runRouteMonitor consumes route-change events and reconciles tableID after a
-// debounce window. It exits only when teardownDone is closed (via
-// stopRouteMonitor); a mid-session subscription death (netlink socket error →
-// updates closed) is recovered by re-subscribing rather than giving up, so
-// staleness tracking survives transient netlink failures.
-//
-// subDone is the live subscription's cancel channel. It is closed (and replaced)
-// on every re-subscription and once more on exit, so no dead subscription's
-// socket or watcher goroutine outlives the event that killed it.
-func (s *routeState) runRouteMonitor(updates <-chan netlink.RouteUpdate, subDone chan struct{}, teardownDone <-chan struct{}) {
-	defer s.monitorWG.Done()
-	// Tears down whichever subscription is live when we exit. The closure reads
-	// the current subDone, which the loop reassigns on each re-subscription.
-	defer func() { close(subDone) }()
-
-	ticker := time.NewTicker(routeMonitorDebounce)
-	defer ticker.Stop()
-
-	dirty := false
-	for {
-		select {
-		case upd, ok := <-updates:
-			if !ok {
-				// Subscription died mid-session. Release the dead subscription's
-				// socket + watcher goroutine, then re-subscribe on a fresh socket
-				// and force a catch-up reconcile (events may have been missed while
-				// it was down). Bail only if we were stopped during backoff.
-				close(subDone)
-				subDone = make(chan struct{})
-				newUpdates, ok := s.resubscribe(subDone, teardownDone)
-				if !ok {
-					return
-				}
-				updates = newUpdates
-				dirty = true
-				continue
-			}
-			if isDefaultRouteUpdate(upd) {
-				dirty = true
-			}
-		case <-ticker.C:
-			if dirty {
-				dirty = false
-				s.reconcile()
-			}
-		case <-teardownDone:
-			return
-		}
-	}
-}
-
-// resubscribe retries the netlink subscription after a mid-session death, with a
-// backoff between attempts. It returns the new updates channel, or ok=false if
-// teardownDone was closed (teardown) while waiting/retrying. All attempts share
-// subDone: a failed subscribe binds nothing, so reuse leaks nothing, and the one
-// that succeeds binds its socket to subDone for the caller to cancel later.
-func (s *routeState) resubscribe(subDone <-chan struct{}, teardownDone <-chan struct{}) (<-chan netlink.RouteUpdate, bool) {
-	for {
-		select {
-		case <-teardownDone:
-			return nil, false
-		case <-time.After(routeMonitorResubscribeBackoff):
-		}
-
-		updates, err := s.subscribeRouteUpdates(subDone)
-		if err != nil {
-			logger.Warnf("gateway route monitor: re-subscribe failed, retrying in %s: %v", routeMonitorResubscribeBackoff, err)
-			continue
-		}
-		logger.Infof("gateway route monitor: re-subscribed after subscription loss")
-		return updates, true
-	}
-}
-
 // reconcile brings the tableID exemption copies back in line with the live host
 // default routes for both families. It NEVER touches the TUN default route or
 // the IPv6 unreachable fence (those are the static catch-all that guarantees no
-// leak) — it only adjusts the marked-libp2p exemption path.
-func (s *routeState) reconcile() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// leak) — it only adjusts the marked-libp2p exemption path. Called from the
+// route monitor's loop (see runRouteMonitor in manager_linux.go); a no-op while
+// the gateway client is disabled.
+func (m *Manager) reconcile() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if newV4, err := s.liveExemptionDefaults(netlink.FAMILY_V4); err != nil {
+	state := m.routeState
+	if state == nil {
+		return
+	}
+
+	if newV4, err := state.liveExemptionDefaults(netlink.FAMILY_V4); err != nil {
 		logger.Warnf("gateway route monitor: list IPv4 defaults: %v", err)
 	} else {
-		s.reconcileTableLocked(&s.origDefaults, newV4, "IPv4")
+		state.reconcileTableLocked(&state.origDefaults, newV4, "IPv4")
 	}
 
 	// Only reconcile IPv6 when the fence/exemption path is actually installed
 	// (a host with a kernel-level disabled IPv6 stack leaves v6RuleAdded false).
-	if s.v6RuleAdded {
-		if newV6, err := s.liveExemptionDefaults(netlink.FAMILY_V6); err != nil {
+	if state.v6RuleAdded {
+		if newV6, err := state.liveExemptionDefaults(netlink.FAMILY_V6); err != nil {
 			if !ipv6Unavailable(err) {
 				logger.Warnf("gateway route monitor: list IPv6 defaults: %v", err)
 			}
 		} else {
-			s.reconcileTableLocked(&s.origDefaultsV6, newV6, "IPv6")
+			state.reconcileTableLocked(&state.origDefaultsV6, newV6, "IPv6")
 		}
 	}
 }
@@ -722,7 +556,7 @@ func (s *routeState) liveExemptionDefaults(family int) ([]netlink.Route, error) 
 // reconcileTableLocked diffs the currently-recorded exemption copies against the
 // desired live set (both keyed by routeKey) and applies the delta to tableID:
 // removing copies whose default disappeared and adding copies for defaults that
-// appeared. current is updated to desired. Must hold s.mu.
+// appeared. current is updated to desired. Caller holds Manager.mu.
 func (s *routeState) reconcileTableLocked(current *[]netlink.Route, desired []netlink.Route, family string) {
 	oldByKey := make(map[string]netlink.Route, len(*current))
 	for _, r := range *current {
@@ -770,17 +604,6 @@ func (s *routeState) reconcileTableLocked(current *[]netlink.Route, desired []ne
 	if changed {
 		logger.Infof("gateway route monitor: re-synced %s default(s) in table %d after a host route change", family, tableID)
 	}
-}
-
-// isDefaultRouteUpdate reports whether a route event concerns a main-table
-// default route (either family). Changes in other tables — including awl's own
-// tableID edits — are ignored, so reconcile never triggers itself.
-func isDefaultRouteUpdate(upd netlink.RouteUpdate) bool {
-	r := upd.Route
-	if r.Table != unix.RT_TABLE_MAIN {
-		return false
-	}
-	return isIPv4DefaultDst(r.Dst) || isIPv6DefaultDst(r.Dst)
 }
 
 // routeKey identifies a default route by its forwarding attributes (the Dst is
