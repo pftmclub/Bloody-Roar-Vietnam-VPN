@@ -31,20 +31,25 @@
 // adapter — are exactly what we assert.
 //
 // Deliberately NOT covered here (vs the Linux suite):
-//   - reaction to route changes (Linux R4/R5): on Windows that machinery is
-//     the sockmark watcher (UNICAST_IF re-bind), not a routes-side monitor —
-//     its integration test lands with the netstate manager refactoring,
-//     see TODO(netstate) in sockmark_windows.go
 //   - client-route stale recovery / leftover collisions (Linux R2/R3):
 //     impossible by design — the routes die with the adapter LUID
 //     (TestGatewayHostNetClientRoutesDieWithAdapter proves exactly that),
 //     and a fresh adapter is a fresh LUID.
+//
+// The Windows counterpart of the Linux route-change reaction (R4/R5) is the
+// marker re-bind, covered by TestGatewayHostNetMarkerRebind below — with a
+// poisoned index, not a real network mutation (see the test comment). Honest
+// mutation of the runner's network (NIC metric flip and the resulting OS
+// callbacks) remains a manual-pass scenario.
 package netstate
 
 import (
 	"context"
 	"fmt"
+	"math/bits"
+	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -158,6 +163,88 @@ func awlNATInstalled(t *testing.T) bool {
 	require.NoError(t, err)
 	_, found := findNetNAT(entries, winNATName)
 	return found
+}
+
+// ---- Marker: watcher re-binds registered sockets on uplink change ----
+
+// rawConn extracts the RawConn of a UDP socket for direct sockopt access.
+func rawConn(t *testing.T, conn net.PacketConn) syscall.RawConn {
+	t.Helper()
+	udp, ok := conn.(*net.UDPConn)
+	require.True(t, ok)
+	raw, err := udp.SyscallConn()
+	require.NoError(t, err)
+	return raw
+}
+
+// getUnicastIF4 reads IP_UNICAST_IF off a socket. Winsock is asymmetric here:
+// setsockopt takes the index in network byte order (see bindSocketToUplink),
+// but getsockopt returns it in host byte order — no conversion needed
+// (verified empirically on a real Winsock: set(htonl(14)) reads back as 14).
+func getUnicastIF4(t *testing.T, conn net.PacketConn) uint32 {
+	t.Helper()
+	var val int
+	var sockErr error
+	require.NoError(t, rawConn(t, conn).Control(func(fd uintptr) {
+		val, sockErr = windows.GetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, ipUnicastIF)
+	}))
+	require.NoError(t, sockErr)
+	return uint32(val)
+}
+
+// setUnicastIF4 writes IP_UNICAST_IF directly (bypassing the Manager), used to
+// plant a stale binding.
+func setUnicastIF4(t *testing.T, conn net.PacketConn, ifIndex uint32) {
+	t.Helper()
+	var sockErr error
+	require.NoError(t, rawConn(t, conn).Control(func(fd uintptr) {
+		sockErr = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, ipUnicastIF,
+			int(bits.ReverseBytes32(ifIndex)))
+	}))
+	require.NoError(t, sockErr)
+}
+
+// TestGatewayHostNetMarkerRebind exercises the notifyNetChange → debounce →
+// redetectUplinks → rebindSockets chain end to end on a real Winsock socket:
+// a registered UDP socket whose binding went stale must be re-bound to the
+// live uplink after a network-change notification.
+//
+// The stored index is poisoned to 0 (and the socket's binding cleared) before
+// the notification — without that the test would prove nothing:
+// redetectUplinks returns before rebindSockets when the re-computed indexes
+// match the stored ones, and the runner's network does not change between
+// Start and the notification, so the socket would simply keep the correct
+// binding it received at creation. Poisoning to 0 is also the realistic
+// shape: it is exactly the offline→online transition.
+//
+// Assertions go through Eventually on the final state only: the OS callbacks
+// registered by Start are live, so background network events may race our
+// notification with an identical re-detection — same chain, same outcome.
+func TestGatewayHostNetMarkerRebind(t *testing.T) {
+	verifyNoLeaks(t)
+	mgr := NewManager()
+	startManager(t, mgr)
+	realIdx := mgr.index4.Load()
+
+	lc := net.ListenConfig{Control: mgr.ControlFunc()}
+	conn, err := lc.ListenPacket(context.Background(), "udp4", ":0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	require.Equal(t, realIdx, getUnicastIF4(t, conn),
+		"a socket created while the uplink is known must be bound at creation")
+
+	// Plant the stale state: the socket unbound, the manager convinced there
+	// is no uplink.
+	setUnicastIF4(t, conn, 0)
+	mgr.index4.Store(0)
+
+	mgr.notifyNetChange()
+
+	require.Eventually(t, func() bool {
+		return getUnicastIF4(t, conn) == realIdx
+	}, 5*time.Second, 50*time.Millisecond,
+		"the watcher must re-detect the uplink and re-bind the registered socket")
 }
 
 // ---- Server: NAT lifecycle ----

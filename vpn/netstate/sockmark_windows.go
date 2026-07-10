@@ -20,7 +20,6 @@
 package netstate
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"math/bits"
@@ -28,7 +27,6 @@ import (
 	"net/netip"
 	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -41,19 +39,6 @@ const (
 	// x/sys/windows).
 	ipUnicastIF   = 31
 	ipv6UnicastIF = 31
-
-	// Debounce parameters for network-change notifications, borrowed from
-	// WireGuard for Windows (tunnel/defaultroutemonitor.go): coalesce bursts
-	// for 150ms, but never delay a re-detection beyond 2s if the burst keeps
-	// going (interface storms during docking/undocking).
-	debounceInterval = 150 * time.Millisecond
-	debounceBurstMax = 2 * time.Second
-
-	// sweepInterval paces the registry liveness sweep. On a stable network
-	// re-apply (the other cleanup point) may not run for weeks; the sweep
-	// guarantees closed sockets don't stay pinned by their RawConn either
-	// way. The registry holds a handful of entries, so this is nearly free.
-	sweepInterval = 2 * time.Minute
 )
 
 // ControlFunc returns a function compatible with net.Dialer.Control and the
@@ -73,7 +58,7 @@ func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn)
 			// (no listen hook in go-libp2p's TCP transport).
 			m.registry.add(network, address, c)
 		}
-		ctrlErr, sockErr := m.apply(network, address, c, false)
+		ctrlErr, sockErr := m.bindSocketToUplink(network, address, c, false)
 		if ctrlErr != nil {
 			return fmt.Errorf("sockmark control: %w", ctrlErr)
 		}
@@ -84,9 +69,10 @@ func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn)
 	}
 }
 
-// apply sets the UNICAST_IF options on one socket. reapply=false (socket
-// creation) skips families whose index is unknown — the option simply stays
-// unset. reapply=true (uplink change) always writes, because writing 0 is the
+// bindSocketToUplink sets the UNICAST_IF options on one socket, pointing it
+// at the current uplink. rebind=false (socket creation) skips families whose
+// index is unknown — the option simply stays
+// unset. rebind=true (uplink change) always writes, because writing 0 is the
 // documented way to clear a stale binding (the socket falls back to regular
 // routing, which is safe: with no uplink there is nothing to leak to, and
 // EnableClientRoutes refuses to enable the gateway while offline).
@@ -94,7 +80,12 @@ func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn)
 // Returns the Control-level error (dead socket — eviction signal for the
 // registry) separately from setsockopt errors (live socket, wrong option —
 // caller logs or fails the dial).
-func (m *Manager) apply(network, address string, c syscall.RawConn, reapply bool) (ctrlErr, sockErr error) {
+//
+// Setsockopt errors are reported only for confident sockets: with
+// confident=false both families are attempted and the wrong family's
+// setsockopt is EXPECTED to fail (see unicastIFFamilies), so surfacing those
+// errors would be noise on every dial and every re-bind of such a socket.
+func (m *Manager) bindSocketToUplink(network, address string, c syscall.RawConn, rebind bool) (ctrlErr, sockErr error) {
 	idx4 := m.index4.Load()
 	idx6 := m.index6.Load()
 	v4, v6, confident := unicastIFFamilies(network, address)
@@ -103,7 +94,7 @@ func (m *Manager) apply(network, address string, c syscall.RawConn, reapply bool
 	ctrlErr = c.Control(func(fd uintptr) {
 		handle := windows.Handle(fd)
 		if v6 {
-			if idx6 != 0 || reapply {
+			if idx6 != 0 || rebind {
 				// IPV6_UNICAST_IF takes the index in host byte order.
 				err := windows.SetsockoptInt(handle, windows.IPPROTO_IPV6, ipv6UnicastIF, int(idx6))
 				if err != nil && confident {
@@ -117,7 +108,7 @@ func (m *Manager) apply(network, address string, c syscall.RawConn, reapply bool
 				v4 = true
 			}
 		}
-		if v4 && (idx4 != 0 || reapply) {
+		if v4 && (idx4 != 0 || rebind) {
 			// IP_UNICAST_IF takes the index in network byte order (htonl);
 			// bits.ReverseBytes32 is the portable equivalent.
 			err := windows.SetsockoptInt(handle, windows.IPPROTO_IP, ipUnicastIF, int(bits.ReverseBytes32(idx4)))
@@ -129,83 +120,9 @@ func (m *Manager) apply(network, address string, c syscall.RawConn, reapply bool
 	return ctrlErr, errors.Join(errs...)
 }
 
-// kick schedules a debounced uplink re-detection. Non-blocking: called from
-// OS notification threads.
-func (m *Manager) kick() {
-	select {
-	case m.kickCh <- struct{}{}:
-	default:
-	}
-}
-
-// watch is the Manager's background goroutine: debounced re-detection on
-// network change notifications plus the periodic registry sweep. cleanup
-// unregisters the OS callbacks when ctx dies.
-//
-// TODO(netstate): the callback → debounce → redetect → setsockopt chain has
-// no integration coverage (unit tests cover only the registry logic; the
-// Linux counterpart R4/R5 hostnet tests cover the routes monitor, which has
-// no Windows analogue — the re-bind IS the Windows reaction to route
-// changes). Add a hostnet-style test — Start → socket via ControlFunc →
-// mutate default routes → assert getsockopt(IP_UNICAST_IF) — after the
-// monitor moves into the netstate manager
-func (m *Manager) watch(ctx context.Context, cleanup func()) {
-	defer cleanup()
-
-	coalesce := time.NewTimer(time.Hour)
-	if !coalesce.Stop() {
-		<-coalesce.C
-	}
-	defer coalesce.Stop()
-	sweep := time.NewTicker(sweepInterval)
-	defer sweep.Stop()
-
-	stopCoalesce := func() {
-		if !coalesce.Stop() {
-			select {
-			case <-coalesce.C:
-			default:
-			}
-		}
-	}
-
-	var burstStart time.Time
-	pending := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-m.kickCh:
-			now := time.Now()
-			switch {
-			case !pending:
-				burstStart = now
-				pending = true
-				coalesce.Reset(debounceInterval)
-			case now.Sub(burstStart) >= debounceBurstMax:
-				// The burst has been going on too long — don't starve the
-				// re-detection, run it now.
-				stopCoalesce()
-				pending = false
-				m.redetect()
-			default:
-				stopCoalesce()
-				coalesce.Reset(debounceInterval)
-			}
-		case <-coalesce.C:
-			pending = false
-			m.redetect()
-		case <-sweep.C:
-			if evicted := m.registry.sweep(); evicted > 0 {
-				logger.Debugf("registry sweep evicted %d closed sockets", evicted)
-			}
-		}
-	}
-}
-
-// redetect recomputes both uplink indexes and, on change, re-binds every
-// registered socket.
-func (m *Manager) redetect() {
+// redetectUplinks recomputes both uplink indexes and, on change, re-binds
+// every registered socket.
+func (m *Manager) redetectUplinks() {
 	idx4, idx6 := m.detectUplinkIndexes()
 	old4 := m.index4.Swap(idx4)
 	old6 := m.index6.Swap(idx6)
@@ -214,14 +131,14 @@ func (m *Manager) redetect() {
 	}
 	logger.Infof("uplink changed: IPv4 ifIndex %d -> %d, IPv6 ifIndex %d -> %d (re-binding %d sockets)",
 		old4, idx4, old6, idx6, m.registry.size())
-	m.reapply()
+	m.rebindSockets()
 }
 
-// reapply re-binds all registered sockets to the current indexes. Sockets
-// whose fd is dead (Control fails) are evicted.
-func (m *Manager) reapply() {
+// rebindSockets re-binds all registered sockets to the current indexes.
+// Sockets whose fd is dead (Control fails) are evicted.
+func (m *Manager) rebindSockets() {
 	m.registry.forEachLive(func(e *registryEntry) error {
-		ctrlErr, sockErr := m.apply(e.network, e.address, e.conn, true)
+		ctrlErr, sockErr := m.bindSocketToUplink(e.network, e.address, e.conn, true)
 		if sockErr != nil {
 			logger.Warnf("re-bind %s socket %s: %v", e.network, e.address, sockErr)
 		}

@@ -4,12 +4,15 @@ package netstate
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/tailscale/wf"
 	"golang.org/x/sys/windows"
@@ -40,8 +43,19 @@ type natState struct {
 	natCreated bool
 	wfpSession *wf.Session
 	// forwardingEnabled lists interfaces where WE flipped IPv4 forwarding on
-	// (it was off before setupNAT). Only these are reverted at teardown.
+	// (it was off before setupNAT or before a forwarding re-sync). Only these
+	// are reverted at teardown; roaming accumulates LUIDs here, all reverted
+	// together in DisableServerNAT.
 	forwardingEnabled []winipcfg.LUID
+
+	// tunLUID is the TUN adapter, resolved once in setupNAT; used by the
+	// forwarding re-sync as the uplink-scan exclusion.
+	tunLUID winipcfg.LUID
+	// uplinkLUID is the uplink whose forwarding the exit node currently
+	// relies on (0 = none — offline start). Compared by LUID, not IfIndex
+	// (Windows reuses interface indexes after adapter removal), and updated
+	// by resyncServerForwarding when the best default route moves.
+	uplinkLUID winipcfg.LUID
 }
 
 // setupNAT configures the Windows exit node: a WFP forward-layer filter that
@@ -78,7 +92,7 @@ func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 		logger.Warnf("recovered from leftover gateway NAT state (previous run was likely killed before teardown)")
 	}
 
-	state := &natState{}
+	state := &natState{tunLUID: tunLUID}
 
 	// 1. WFP forward-layer BLOCK — the safety fence goes up first.
 	if err := setupWFP(state, tunIfIndex, awlPrefix); err != nil {
@@ -90,14 +104,8 @@ func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	// interface holding the best default route right now; if the host is
 	// offline we still bring the server up (parity with Linux, where
 	// ServerEnabled is applied at startup regardless of connectivity) and
-	// only warn — transit starts working when setupNAT next runs with a
-	// live uplink.
-	//
-	// TODO(netstate): if the uplink changes mid-session (or appears after an
-	// offline start), the new uplink keeps its own forwarding value and
-	// transit needs a gateway server off/on toggle.
-	// Fix is a route-change subscriber that re-syncs
-	// forwarding on the new uplink; lands with the netstate refactoring
+	// only warn — the network-change watcher re-syncs forwarding onto the
+	// uplink when one appears or changes (resyncServerForwarding).
 	forwardingTargets := []winipcfg.LUID{tunLUID}
 	route, ok, err := bestUplinkDefault(windows.AF_INET, tunLUID)
 	if err != nil {
@@ -105,10 +113,11 @@ func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 		return nil, fmt.Errorf("detect uplink for forwarding: %w", err)
 	}
 	if ok {
-		forwardingTargets = append(forwardingTargets, winipcfg.LUID(route.IfLUID))
+		state.uplinkLUID = winipcfg.LUID(route.IfLUID)
+		forwardingTargets = append(forwardingTargets, state.uplinkLUID)
 	} else {
-		logger.Warnf("no IPv4 default route found: enabling forwarding on TUN only, " +
-			"internet transit will not work until the gateway server is re-enabled with an active uplink")
+		logger.Warnf("no IPv4 uplink right now: enabling forwarding on TUN only, " +
+			"internet transit will start automatically when network appears")
 	}
 	for _, luid := range forwardingTargets {
 		enabledByUs, err := enableIPv4Forwarding(luid)
@@ -166,6 +175,68 @@ func (m *Manager) teardownNAT(state *natState) error {
 	return errors.Join(errs...)
 }
 
+// resyncServerForwarding is the exit node's reaction to a (debounced) network
+// change: when the best IPv4 uplink appears or moves to another interface,
+// enable IPv4 forwarding on it so internet transit survives exit-node roaming
+// and an offline server start heals itself once connectivity appears. Called
+// from the watch goroutine (see onNetworkChange); a no-op while the server is
+// disabled. Only forwarding is uplink-bound and needs this: the WinNAT
+// instance is tied to the awl subnet and the WFP filter to the TUN ifIndex.
+func (m *Manager) resyncServerForwarding() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	state := m.natState
+	if state == nil {
+		return
+	}
+	route, ok, err := bestUplinkDefault(windows.AF_INET, state.tunLUID)
+	if err != nil {
+		logger.Errorf("gateway server forwarding re-sync: detect uplink: %v", err)
+		return
+	}
+	resyncForwarding(state, route, ok, enableIPv4Forwarding)
+}
+
+// resyncForwarding is the decision half of resyncServerForwarding, split from
+// the live table scan and the lock so it can be unit-tested with a fake
+// enable. Caller holds Manager.mu.
+//
+// Semantics:
+//   - no uplink (ok=false): keep state as-is. Forwarding on the abandoned
+//     uplink is deliberately NOT disabled — another consumer (ICS, containers,
+//     other VPNs) may rely on it; a spurious flag is the lesser evil. It is
+//     reverted at teardown iff we enabled it.
+//   - same uplink: no-op. In particular a forwarding flag flipped off
+//     externally on the current uplink is NOT re-enabled (we don't fight other
+//     software — same hands-off stance as the Linux ip_forward handling).
+//   - enable failure: uplinkLUID is left unchanged so the next network event
+//     retries.
+func resyncForwarding(state *natState, route uplinkRoute, ok bool, enable func(winipcfg.LUID) (bool, error)) {
+	if !ok {
+		return
+	}
+	newLUID := winipcfg.LUID(route.IfLUID)
+	if newLUID == state.uplinkLUID {
+		return
+	}
+
+	enabledByUs, err := enable(newLUID)
+	if err != nil {
+		logger.Errorf("gateway server forwarding re-sync: enable forwarding on new uplink (ifIndex %d): %v",
+			route.IfIndex, err)
+		return
+	}
+	// Membership check: roaming back to an uplink we already enabled once
+	// (and whose forwarding got flipped off in between) must not record a
+	// second teardown entry.
+	if enabledByUs && !slices.Contains(state.forwardingEnabled, newLUID) {
+		state.forwardingEnabled = append(state.forwardingEnabled, newLUID)
+	}
+	state.uplinkLUID = newLUID
+	logger.Infof("gateway server: uplink changed, IPv4 forwarding ensured on new uplink (ifIndex %d)", route.IfIndex)
+}
+
 // setupWFP opens a dynamic WFP session and installs one BLOCK filter on the
 // IPv4 forward layer:
 //
@@ -197,34 +268,41 @@ func (m *Manager) teardownNAT(state *natState) error {
 func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error {
 	session, err := wf.New(&wf.Options{
 		Name:        "Anywherelan VPN gateway",
-		Description: "Blocks forwarded traffic from awl peers to the exit node's private networks",
+		Description: "Blocks forwarded traffic from awl devices to the exit node's private networks",
 		Dynamic:     true,
 	})
 	if err != nil {
 		return fmt.Errorf("open WFP session: %w", err)
 	}
-	// From here on the session must end up either in state (success) or
-	// closed (failure) — otherwise the dynamic session (and the guarantees
-	// tied to its lifetime) would dangle until process exit.
+	// Parked in state immediately, so on any later failure the caller's
+	// rollback (teardownNAT) closes the session — the same idiom as the
+	// forwarding and WinNAT steps. A dangling dynamic session would otherwise
+	// outlive its guarantees until process exit.
+	state.wfpSession = session
 
 	sublayerID, err := newWFPGUID()
 	if err != nil {
-		_ = session.Close()
 		return err
 	}
+	// Weight 0x8000 = the midpoint of the uint16 sublayer range. Sublayers
+	// arbitrate high-to-low, and our BLOCK loses only to a hard permit
+	// (CLEAR_ACTION_RIGHT) from a higher-weight sublayer — see the rule
+	// comment below. The midpoint deliberately does NOT claim the top:
+	// this filter fences awl's forwarded transit, it is not a host
+	// kill-switch, so a security product that outranks us on purpose (EDR,
+	// corporate firewall) is allowed to win. Contrast wireguard-windows,
+	// whose firewall takes 0xFFFF exactly because it IS a kill-switch.
 	err = session.AddSublayer(&wf.Sublayer{
 		ID:     wf.SublayerID(sublayerID),
 		Name:   wfpSublayerName,
 		Weight: 0x8000,
 	})
 	if err != nil {
-		_ = session.Close()
 		return fmt.Errorf("add WFP sublayer: %w", err)
 	}
 
 	ruleID, err := newWFPGUID()
 	if err != nil {
-		_ = session.Close()
 		return err
 	}
 	conditions := []*wf.Match{
@@ -236,6 +314,9 @@ func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error 
 			Field: wf.FieldIPDestinationAddress, Op: wf.MatchTypeEqual, Value: p,
 		})
 	}
+	// The filter weight arbitrates only among filters INSIDE our own
+	// sublayer, and we install exactly one — any non-zero value behaves
+	// identically. 1000 just leaves room on both sides for future rules.
 	err = session.AddRule(&wf.Rule{
 		ID:         wf.RuleID(ruleID),
 		Name:       wfpRuleName,
@@ -246,11 +327,9 @@ func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error 
 		Action:     wf.ActionBlock,
 	})
 	if err != nil {
-		_ = session.Close()
 		return fmt.Errorf("add WFP block rule: %w", err)
 	}
 
-	state.wfpSession = session
 	return nil
 }
 
@@ -298,10 +377,23 @@ func disableIPv4Forwarding(luid winipcfg.LUID) error {
 	return nil
 }
 
+// powerShellTimeout bounds one runPowerShell invocation. Generous: a cold
+// PowerShell start plus New-NetNat normally fits in a few seconds, so a
+// minute only ever fires on a genuine hang.
+const powerShellTimeout = time.Minute
+
 // runPowerShell executes one PowerShell command line. -Command is unaffected
 // by execution policy; powershell.exe is present down to Server Core.
+//
+// The timeout matters for liveness, not just hygiene: PowerShell can hang
+// (WinNAT's WinRT plumbing has been seen blocking), the callers run under
+// m.mu, and since the forwarding re-sync runs on the watch goroutine, a
+// wedged PowerShell would freeze socket re-binding along with all gateway
+// operations. The timeout turns that into an error.
 func runPowerShell(command string) ([]byte, error) {
-	out, err := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), powerShellTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("powershell %q: %w (output: %s)", command, err, strings.TrimSpace(string(out)))
 	}

@@ -70,6 +70,11 @@ func (r *sockRegistry) remove(e *registryEntry) {
 // apply must return an error only for Control-level failures (dead fd) —
 // setsockopt failures on a live socket are the caller's to log, not an
 // eviction signal.
+//
+// Iterating a snapshot outside the lock is race-free by construction: the map
+// is keyed by *registryEntry identity, so a socket re-registered concurrently
+// is a fresh entry and remove of the stale pointer is a no-op delete — as is
+// a concurrent eviction of the same entry by sweep and re-apply.
 func (r *sockRegistry) forEachLive(apply func(e *registryEntry) error) int {
 	evicted := 0
 	for _, e := range r.snapshot() {
