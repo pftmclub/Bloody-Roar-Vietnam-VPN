@@ -4,15 +4,15 @@ package netstate
 
 import "errors"
 
-// NATState holds the state needed to teardown NAT rules.
-type NATState struct{}
+// natState holds the state needed to teardown NAT rules.
+type natState struct{}
 
-// SetupNAT is not supported on this platform.
-func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
+// setupNAT is not supported on this platform.
+func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	return nil, errors.New("NAT setup not supported on this platform")
 }
 
-// TeardownNAT is not supported on this platform.
-func TeardownNAT(state *NATState) error {
+// teardownNAT is not supported on this platform.
+func teardownNAT(state *natState) error {
 	return nil
 }

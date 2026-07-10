@@ -16,9 +16,9 @@ const fwMark uint32 = awlMark
 
 type linuxMarker struct{}
 
-// New constructs a Marker for Linux. Setting SO_MARK requires CAP_NET_ADMIN,
+// newMarker constructs the marker for Linux. Setting SO_MARK requires CAP_NET_ADMIN,
 // which AWL already needs for TUN setup, so no extra capability is required.
-func New() Marker {
+func newMarker() marker {
 	return linuxMarker{}
 }
 

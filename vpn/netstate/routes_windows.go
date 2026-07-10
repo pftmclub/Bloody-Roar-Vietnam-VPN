@@ -11,13 +11,13 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// RouteState holds the state needed to teardown gateway routes on Windows.
-type RouteState struct {
+// routeState holds the state needed to teardown gateway routes on Windows.
+type routeState struct {
 	tunLUID winipcfg.LUID
 	routes  []winipcfg.MibIPforwardRow2
 }
 
-// SetupGatewayRoutes configures the gateway client routes on Windows:
+// setupGatewayRoutes configures the gateway client routes on Windows:
 //
 //   - 0.0.0.0/1 + 128.0.0.0/1 via the TUN. More specific than the existing /0
 //     default, so they win longest-prefix-match without replacing it.
@@ -38,13 +38,13 @@ type RouteState struct {
 //
 // fwmark is unused on Windows — sockets are bound to the physical interface
 // via IP_UNICAST_IF; see sockmark_windows.go.
-func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
+func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	luid, err := luidFromGUIDName(tunIfName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve TUN interface: %w", err)
 	}
 
-	state := &RouteState{
+	state := &routeState{
 		tunLUID: luid,
 	}
 
@@ -54,7 +54,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 	}
 	for _, prefix := range v4Prefixes {
 		if err := state.addTunRoute(prefix, netip.IPv4Unspecified()); err != nil {
-			_ = TeardownGatewayRoutes(state)
+			_ = teardownGatewayRoutes(state)
 			return nil, err
 		}
 	}
@@ -76,7 +76,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 		}
 		// v6 exists on the adapter but the fence could not be installed —
 		// continuing would silently leak IPv6 around the gateway.
-		_ = TeardownGatewayRoutes(state)
+		_ = teardownGatewayRoutes(state)
 		return nil, fmt.Errorf("install IPv6 fail-closed fence: %w", err)
 	}
 
@@ -85,7 +85,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 
 // addTunRoute creates one on-link route (unspecified next hop) via the TUN
 // and records it for teardown.
-func (state *RouteState) addTunRoute(prefix netip.Prefix, nextHop netip.Addr) error {
+func (state *routeState) addTunRoute(prefix netip.Prefix, nextHop netip.Addr) error {
 	row := winipcfg.MibIPforwardRow2{}
 	// InitializeIpForwardEntry is mandatory before CreateIpForwardEntry2
 	// it sets ValidLifetime/PreferredLifetime to infinite and Protocol to NetMgmt.
@@ -118,8 +118,8 @@ func tunHasIPv6(luid winipcfg.LUID) bool {
 	return err == nil
 }
 
-// TeardownGatewayRoutes removes the routes added by SetupGatewayRoutes.
-func TeardownGatewayRoutes(state *RouteState) error {
+// teardownGatewayRoutes removes the routes added by setupGatewayRoutes.
+func teardownGatewayRoutes(state *routeState) error {
 	if state == nil {
 		return nil
 	}

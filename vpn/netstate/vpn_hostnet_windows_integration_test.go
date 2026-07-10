@@ -2,8 +2,8 @@
 
 // Package netstate host-network integration tests, Windows edition.
 //
-// These tests exercise the real Windows plumbing (SetupNAT/TeardownNAT and
-// SetupGatewayRoutes/TeardownGatewayRoutes) against the *actual* host
+// These tests exercise the real Windows plumbing (setupNAT/teardownNAT and
+// setupGatewayRoutes/teardownGatewayRoutes) against the *actual* host
 // network: they create WinNAT instances, WFP filters, flip per-interface
 // forwarding, spawn a real Wintun adapter and install /1 routes on it.
 //
@@ -153,14 +153,14 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 	forwardingBefore := forwardingEnabled(t, nicLUID)
 	require.False(t, awlNATInstalled(t), "pre-existing awl-gateway NetNat; clean the host before running")
 
-	state, err := SetupNAT(testAwlSubnet, nicGUID)
+	state, err := setupNAT(testAwlSubnet, nicGUID)
 	require.NoError(t, err)
 
 	require.True(t, awlNATInstalled(t), "NetNat must exist while NAT is up")
 	require.True(t, forwardingEnabled(t, nicLUID), "forwarding must be on while NAT is up")
 	require.True(t, wfpRuleInstalled(t), "WFP block rule must be installed while NAT is up")
 
-	require.NoError(t, TeardownNAT(state))
+	require.NoError(t, teardownNAT(state))
 
 	require.False(t, awlNATInstalled(t), "teardown must remove the NetNat")
 	require.Equal(t, forwardingBefore, forwardingEnabled(t, nicLUID),
@@ -173,7 +173,7 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 // TestGatewayHostNetNATPreservesExistingForwarding is the Windows counterpart
 // of the Linux "pre-existing ip_forward=1 stays on" test: interfaces that
 // already forward (other VPNs, containers, ICS — or a previous awl run that
-// was killed, leaving the flag set) must be left alone by TeardownNAT.
+// was killed, leaving the flag set) must be left alone by teardownNAT.
 // Unlike the Linux test (which skips unless the host happens to have
 // ip_forward pre-enabled), the per-interface flag lets us set up the
 // precondition deterministically.
@@ -187,11 +187,11 @@ func TestGatewayHostNetNATPreservesExistingForwarding(t *testing.T) {
 		t.Cleanup(func() { setForwarding(t, nicLUID, false) })
 	}
 
-	state, err := SetupNAT(testAwlSubnet, nicGUID)
+	state, err := setupNAT(testAwlSubnet, nicGUID)
 	require.NoError(t, err)
 	require.True(t, forwardingEnabled(t, nicLUID))
 
-	require.NoError(t, TeardownNAT(state))
+	require.NoError(t, teardownNAT(state))
 	require.True(t, forwardingEnabled(t, nicLUID),
 		"forwarding was already on before setup; teardown must NOT disable it")
 }
@@ -208,11 +208,11 @@ func TestGatewayHostNetNATStaleRecovery(t *testing.T) {
 	require.NoError(t, createWinNAT(testAwlSubnet))
 	require.True(t, awlNATInstalled(t))
 
-	state, err := SetupNAT(testAwlSubnet, nicGUID)
-	require.NoError(t, err, "SetupNAT must recover from a stale awl-gateway NetNat")
+	state, err := setupNAT(testAwlSubnet, nicGUID)
+	require.NoError(t, err, "setupNAT must recover from a stale awl-gateway NetNat")
 	require.True(t, awlNATInstalled(t))
 
-	require.NoError(t, TeardownNAT(state))
+	require.NoError(t, teardownNAT(state))
 	require.False(t, awlNATInstalled(t))
 }
 
@@ -239,11 +239,11 @@ func TestGatewayHostNetNATRollback(t *testing.T) {
 		_, _ = runPowerShell(fmt.Sprintf("Remove-NetNat -Name %s -Confirm:$false", conflictName))
 	})
 
-	state, err := SetupNAT(testAwlSubnet, nicGUID)
+	state, err := setupNAT(testAwlSubnet, nicGUID)
 	if err == nil {
 		// If even overlapping-prefix instances are tolerated, there is no
 		// failure to roll back from. Clean up and skip rather than fail.
-		require.NoError(t, TeardownNAT(state))
+		require.NoError(t, teardownNAT(state))
 		t.Skip("this host allows overlapping WinNAT instances; rollback path not reachable here")
 	}
 	require.Contains(t, err.Error(), "WinNAT", "failure must come from the WinNAT step")
@@ -315,7 +315,7 @@ func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 	requireAdmin(t)
 	tunLUID, tunGUID, _ := createTestTUN(t)
 
-	state, err := SetupGatewayRoutes(tunGUID, 0)
+	state, err := setupGatewayRoutes(tunGUID, 0)
 	require.NoError(t, err)
 	// Egress of this host is now captured by the /1 routes into a TUN nobody
 	// reads — a black hole until teardown a few lines down.
@@ -328,7 +328,7 @@ func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 		require.Contains(t, routes, "8000::/1")
 	}
 
-	require.NoError(t, TeardownGatewayRoutes(state))
+	require.NoError(t, teardownGatewayRoutes(state))
 
 	for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"} {
 		require.NotContains(t, tunRoutes(t, tunLUID), prefix,
@@ -345,7 +345,7 @@ func TestGatewayHostNetClientRoutesDieWithAdapter(t *testing.T) {
 	requireAdmin(t)
 	tunLUID, tunGUID, device := createTestTUN(t)
 
-	_, err := SetupGatewayRoutes(tunGUID, 0)
+	_, err := setupGatewayRoutes(tunGUID, 0)
 	require.NoError(t, err)
 	require.Contains(t, tunRoutes(t, tunLUID), "0.0.0.0/1")
 

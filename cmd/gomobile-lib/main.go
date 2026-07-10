@@ -64,7 +64,7 @@ type SocketProtector interface {
 
 // StartServerWithProtector starts the server, registering a socket protector
 // so that libp2p and other sockets bypass the VPN. The protector reference is held by
-// the Application's netstate.Marker for the lifetime of the run; calling
+// the Application's netstate manager for the lifetime of the run; calling
 // StopServer drops it.
 //
 // When VPN gateway client mode is enabled in the saved config, the host app
@@ -80,7 +80,7 @@ func StartServer(tunFD int32, protector SocketProtector) (err error) {
 
 	globalApp = awl.New()
 	globalApp.SetupLoggerAndConfig(appType)
-	globalApp.SockMarker = netstate.NewAndroid(protectorToFunc(protector))
+	globalApp.NetManager = netstate.NewAndroidManager(protectorToFunc(protector))
 
 	// A tunFD of 0 means the host did not establish a VPN interface (VPN
 	// disabled in config); Init then skips the VPN device entirely. Otherwise

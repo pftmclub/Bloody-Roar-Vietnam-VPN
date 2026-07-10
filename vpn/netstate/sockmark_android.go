@@ -13,36 +13,37 @@ import (
 // on success.
 type ProtectFunc func(fd int) bool
 
-// AndroidMarker invokes a host-supplied callback for each libp2p socket so
+// androidMarker invokes a host-supplied callback for each libp2p socket so
 // the host's VpnService.protect() can mark the socket as bypassing the TUN.
 //
-// The protector is set once at construction (via NewAndroid). To change it,
+// The protector is set once at construction (via newAndroidMarker). To change it,
 // stop the application and start a new one with a fresh marker. This avoids
 // any runtime synchronisation and matches the gomobile-lib lifecycle
 // (one Application instance per StartServer call).
-type AndroidMarker struct {
+type androidMarker struct {
 	protect ProtectFunc
 }
 
-// NewAndroid returns a Marker that calls protect for each new socket.
+// newAndroidMarker returns a marker that calls protect for each new socket.
 // Pass nil to construct a no-op marker (ControlFunc will return nil).
-func NewAndroid(protect ProtectFunc) *AndroidMarker {
-	return &AndroidMarker{protect: protect}
+func newAndroidMarker(protect ProtectFunc) *androidMarker {
+	return &androidMarker{protect: protect}
 }
 
-// New returns a no-op Android marker. Production code should use NewAndroid
-// with a protector wired to VpnService.protect; New exists so that callers
-// of the platform-agnostic Marker API have a sensible default and tests
-// that don't enable gateway mode don't have to special-case Android.
-func New() Marker { return NewAndroid(nil) }
+// newMarker returns a no-op Android marker. Production code should construct
+// the Manager via NewAndroidManager with a protector wired to
+// VpnService.protect; newMarker exists so that NewManager has a sensible
+// default and callers that don't enable gateway mode don't have to
+// special-case Android.
+func newMarker() marker { return newAndroidMarker(nil) }
 
-func (m *AndroidMarker) FWMark() uint32 { return 0 }
+func (m *androidMarker) FWMark() uint32 { return 0 }
 
 // Start is a no-op: socket protection is delegated to the host's
 // VpnService.protect, which owns its own network tracking.
-func (m *AndroidMarker) Start(_ context.Context) error { return nil }
+func (m *androidMarker) Start(_ context.Context) error { return nil }
 
-func (m *AndroidMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
+func (m *androidMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	if m.protect == nil {
 		return nil
 	}

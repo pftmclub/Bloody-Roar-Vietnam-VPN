@@ -4,15 +4,15 @@ package netstate
 
 import "errors"
 
-// RouteState holds the state needed to teardown gateway routes.
-type RouteState struct{}
+// routeState holds the state needed to teardown gateway routes.
+type routeState struct{}
 
-// SetupGatewayRoutes is not supported on this platform.
-func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
+// setupGatewayRoutes is not supported on this platform.
+func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	return nil, errors.New("gateway routes not supported on this platform")
 }
 
-// TeardownGatewayRoutes is not supported on this platform.
-func TeardownGatewayRoutes(state *RouteState) error {
+// teardownGatewayRoutes is not supported on this platform.
+func teardownGatewayRoutes(state *routeState) error {
 	return nil
 }

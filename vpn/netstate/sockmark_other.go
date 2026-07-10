@@ -9,10 +9,10 @@ import (
 
 type noopMarker struct{}
 
-// New returns a Marker that disables socket marking. application.go also
+// newMarker returns a marker that disables socket marking. application.go also
 // blocks gateway mode on these platforms via setupGateway, so this should
 // never be hit at runtime.
-func New() Marker { return noopMarker{} }
+func newMarker() marker { return noopMarker{} }
 
 func (noopMarker) FWMark() uint32 { return 0 }
 

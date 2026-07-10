@@ -19,7 +19,7 @@ const (
 	wfpRuleName     = "awl-gateway: block forwarded LAN/CGNAT egress from TUN"
 )
 
-// NATState holds the state needed to teardown NAT on Windows.
+// natState holds the state needed to teardown NAT on Windows.
 //
 // Crash semantics (kill -9): the WFP session below is Dynamic, so the kernel
 // removes its sublayer and filter the moment the process dies — no stale
@@ -27,27 +27,27 @@ const (
 // survive a crash, but they cannot cause transit on their own: the exit-node
 // data path runs through this userspace process (libp2p → TUN write) and the
 // Wintun adapter disappears with it. The leftover NetNat is removed by
-// stale-recovery on the next SetupNAT; the forwarding flags are left as-is
+// stale-recovery on the next setupNAT; the forwarding flags are left as-is
 // forever — their provenance is unknown after a crash (the next run sees
 // "enabled" and treats it as "was already enabled"), same caveat as the Linux
 // ip_forward handling.
-type NATState struct {
+type natState struct {
 	natCreated bool
 	wfpSession *wf.Session
 	// forwardingEnabled lists interfaces where WE flipped IPv4 forwarding on
-	// (it was off before SetupNAT). Only these are reverted at teardown.
+	// (it was off before setupNAT). Only these are reverted at teardown.
 	forwardingEnabled []winipcfg.LUID
 }
 
-// SetupNAT configures the Windows exit node: a WFP forward-layer filter that
+// setupNAT configures the Windows exit node: a WFP forward-layer filter that
 // keeps clients out of the exit node's LAN/CGNAT space, per-interface IPv4
 // forwarding on the TUN and the uplink, and a WinNAT instance providing
 // MASQUERADE-style translation for the awl subnet.
 //
 // Order matters and is fail-closed: the WFP BLOCK filter is installed before
 // forwarding/NAT create any technical possibility of transit. Any failure
-// after the first step rolls back via TeardownNAT (all steps are idempotent).
-func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
+// after the first step rolls back via teardownNAT (all steps are idempotent).
+func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	awlPrefix, err := netip.ParsePrefix(awlSubnet)
 	if err != nil {
 		return nil, fmt.Errorf("parse awl subnet %q: %w", awlSubnet, err)
@@ -62,7 +62,7 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	}
 	tunIfIndex := tunIfRow.InterfaceIndex
 
-	// Stale recovery: a previous run killed before TeardownNAT leaves its
+	// Stale recovery: a previous run killed before teardownNAT leaves its
 	// NetNat behind (WFP leftovers are impossible — dynamic session). Remove
 	// it so New-NetNat below gets a clean slate.
 	cleaned, err := cleanupStaleWinNAT()
@@ -73,11 +73,11 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 		logger.Warnf("recovered from leftover gateway NAT state (previous run was likely killed before teardown)")
 	}
 
-	state := &NATState{}
+	state := &natState{}
 
 	// 1. WFP forward-layer BLOCK — the safety fence goes up first.
 	if err := setupWFP(state, tunIfIndex, awlPrefix); err != nil {
-		_ = TeardownNAT(state)
+		_ = teardownNAT(state)
 		return nil, fmt.Errorf("setup WFP filter: %w", err)
 	}
 
@@ -85,7 +85,7 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	// interface holding the best default route right now; if the host is
 	// offline we still bring the server up (parity with Linux, where
 	// ServerEnabled is applied at startup regardless of connectivity) and
-	// only warn — transit starts working when SetupNAT next runs with a
+	// only warn — transit starts working when setupNAT next runs with a
 	// live uplink.
 	//
 	// TODO(netstate): if the uplink changes mid-session (or appears after an
@@ -96,7 +96,7 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	forwardingTargets := []winipcfg.LUID{tunLUID}
 	route, ok, err := bestUplinkDefault(windows.AF_INET, tunLUID)
 	if err != nil {
-		_ = TeardownNAT(state)
+		_ = teardownNAT(state)
 		return nil, fmt.Errorf("detect uplink for forwarding: %w", err)
 	}
 	if ok {
@@ -108,7 +108,7 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	for _, luid := range forwardingTargets {
 		enabledByUs, err := enableIPv4Forwarding(luid)
 		if err != nil {
-			_ = TeardownNAT(state)
+			_ = teardownNAT(state)
 			return nil, fmt.Errorf("enable forwarding on interface %d: %w", luid, err)
 		}
 		if enabledByUs {
@@ -119,7 +119,7 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	// 3. WinNAT instance — transit becomes possible only now, with the WFP
 	// fence already in place.
 	if err := createWinNAT(awlSubnet); err != nil {
-		_ = TeardownNAT(state)
+		_ = teardownNAT(state)
 		return nil, err
 	}
 	state.natCreated = true
@@ -127,11 +127,11 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 	return state, nil
 }
 
-// TeardownNAT reverses SetupNAT in reverse order: WinNAT first (internet
+// teardownNAT reverses setupNAT in reverse order: WinNAT first (internet
 // transit dies), then forwarding (LAN transit dies), then the WFP session —
 // the protection is removed last, when transit is no longer possible. Errors
 // are collected; teardown proceeds through all steps. Safe on partial state.
-func TeardownNAT(state *NATState) error {
+func teardownNAT(state *natState) error {
 	if state == nil {
 		return nil
 	}
@@ -189,7 +189,7 @@ func TeardownNAT(state *NATState) error {
 // The session is Dynamic: everything installed here is removed by the kernel
 // when the session closes or the process dies, so there is no stale-WFP
 // recovery path.
-func setupWFP(state *NATState, tunIfIndex uint32, awlPrefix netip.Prefix) error {
+func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error {
 	session, err := wf.New(&wf.Options{
 		Name:        "Anywherelan VPN gateway",
 		Description: "Blocks forwarded traffic from awl peers to the exit node's private networks",

@@ -3,7 +3,7 @@
 // Package netstate host-network integration tests.
 //
 // These tests exercise the real Linux netfilter / netlink plumbing
-// (SetupNAT/TeardownNAT and SetupGatewayRoutes/TeardownGatewayRoutes) against
+// (setupNAT/teardownNAT and setupGatewayRoutes/teardownGatewayRoutes) against
 // the *actual* host network: they create a dummy `awl0` link, install ip rules,
 // iptables chains and routes, and assert they are applied and then fully torn
 // down.
@@ -53,7 +53,7 @@ const (
 	ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
 )
 
-func testFWMark() uint32 { return New().FWMark() }
+func testFWMark() uint32 { return newMarker().FWMark() }
 
 // ---- N1: NAT apply/teardown lifecycle ----
 
@@ -65,13 +65,13 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state, err := SetupNAT(testAwlSubnet, testTunIf)
+	state, err := setupNAT(testAwlSubnet, testTunIf)
 	require.NoError(t, err)
 
 	assertNATApplied(t)
 	require.Equal(t, "1", readForward(t), "ip_forward must be on while NAT is up")
 
-	require.NoError(t, TeardownNAT(state))
+	require.NoError(t, teardownNAT(state))
 
 	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup netfilter state")
 	require.Equal(t, origForward, readForward(t),
@@ -80,7 +80,7 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 
 // ---- N2: NAT re-setup is idempotent (kill -9 recovery) ----
 //
-// A second SetupNAT without a teardown in between is exactly what happens after
+// A second setupNAT without a teardown in between is exactly what happens after
 // a crash: cleanupStaleNAT must recover the leftover scaffolding so NewChain
 // succeeds and the resulting state is identical to a single clean setup.
 
@@ -92,19 +92,19 @@ func TestGatewayHostNetNATIdempotentResetup(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	_, err := SetupNAT(testAwlSubnet, testTunIf)
+	_, err := setupNAT(testAwlSubnet, testTunIf)
 	require.NoError(t, err)
 	applied1 := snapshotNet(t)
 
 	// Second setup over the live state of the first — simulates a leftover from
-	// a process that was killed before TeardownNAT ran.
-	state2, err := SetupNAT(testAwlSubnet, testTunIf)
+	// a process that was killed before teardownNAT ran.
+	state2, err := setupNAT(testAwlSubnet, testTunIf)
 	require.NoError(t, err, "re-setup over leftover state must succeed (cleanupStaleNAT)")
 	applied2 := snapshotNet(t)
 
 	require.Equal(t, applied1, applied2, "re-setup must produce identical state, no duplicate rules")
 
-	require.NoError(t, TeardownNAT(state2))
+	require.NoError(t, teardownNAT(state2))
 	require.Equal(t, before, snapshotNet(t), "single teardown must clean everything after a re-setup")
 }
 
@@ -120,11 +120,11 @@ func TestGatewayHostNetNATPreservesExistingIPForward(t *testing.T) {
 		t.Skip("ip_forward is not already on; this case needs a host where it was pre-enabled (e.g. Docker)")
 	}
 
-	state, err := SetupNAT(testAwlSubnet, testTunIf)
+	state, err := setupNAT(testAwlSubnet, testTunIf)
 	require.NoError(t, err)
 	require.Equal(t, "1", readForward(t))
 
-	require.NoError(t, TeardownNAT(state))
+	require.NoError(t, teardownNAT(state))
 	require.Equal(t, "1", readForward(t),
 		"ip_forward was already on before setup; teardown must NOT reset it to 0")
 }
@@ -139,12 +139,12 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state, err := setupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err)
 
 	assertRoutesApplied(t)
 
-	require.NoError(t, TeardownGatewayRoutes(state))
+	require.NoError(t, teardownGatewayRoutes(state))
 	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup routing state")
 }
 
@@ -152,7 +152,7 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 //
 // Deleting the link drops the kernel default route via it (mirrors a real TUN
 // dying with its process), while the fwmark rule and the auxiliary-table copies
-// are orphaned. A fresh SetupGatewayRoutes must clean those up (cleanupStaleRoutes)
+// are orphaned. A fresh setupGatewayRoutes must clean those up (cleanupStaleRoutes)
 // and succeed without an EEXIST on the new TUN default.
 
 func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
@@ -163,7 +163,7 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state1, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state1, err := setupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err)
 	applied1 := snapshotNet(t)
 
@@ -177,11 +177,11 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 	// default route via it, leaving the fwmark rule + table copies orphaned.
 	recreateDummyTun(t)
 
-	state2, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state2, err := setupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err, "re-setup must recover orphaned ip rule + table routes (cleanupStaleRoutes)")
 	require.Equal(t, applied1, snapshotNet(t), "recovered state must match a clean single setup")
 
-	require.NoError(t, TeardownGatewayRoutes(state2))
+	require.NoError(t, teardownGatewayRoutes(state2))
 	require.Equal(t, before, snapshotNet(t))
 }
 
@@ -190,7 +190,7 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 // cleanupStaleRoutes deliberately never deletes the TUN default route (no
 // reliable owner-tag; deleting by metric risks nuking dhclient/OpenVPN routes).
 // So when the link did NOT go away (here: a still-present dummy with the route
-// seeded), SetupGatewayRoutes must surface a clear diagnostic instead of
+// seeded), setupGatewayRoutes must surface a clear diagnostic instead of
 // duplicating or clobbering.
 
 func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
@@ -209,7 +209,7 @@ func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
 	require.NoError(t, netlink.RouteAdd(leftover))
 	t.Cleanup(func() { _ = netlink.RouteDel(leftover) })
 
-	_, err = SetupGatewayRoutes(testTunIf, testFWMark())
+	_, err = setupGatewayRoutes(testTunIf, testFWMark())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "leftover from a prior awl run",
 		"a colliding TUN default must produce the operator-facing diagnostic")
@@ -232,9 +232,9 @@ func TestGatewayHostNetRoutesStalenessReconcile(t *testing.T) {
 	requireDefaultRoute(t)
 	setupDummyTun(t)
 
-	state, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state, err := setupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = TeardownGatewayRoutes(state) })
+	t.Cleanup(func() { _ = teardownGatewayRoutes(state) })
 
 	// A second dummy "uplink" with an on-link subnet and its own default route,
 	// at a high metric so it never competes with real egress or the TUN default.
@@ -287,9 +287,9 @@ func TestGatewayHostNetRoutesStalenessReconcileV6(t *testing.T) {
 	}
 	setupDummyTun(t)
 
-	state, err := SetupGatewayRoutes(testTunIf, testFWMark())
+	state, err := setupGatewayRoutes(testTunIf, testFWMark())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = TeardownGatewayRoutes(state) })
+	t.Cleanup(func() { _ = teardownGatewayRoutes(state) })
 
 	// A second dummy "uplink" with an on-link v6 subnet and its own v6 default,
 	// at a high metric so it never competes with real egress or the fence.
@@ -391,7 +391,7 @@ func assertRoutesApplied(t *testing.T) {
 // snapshot
 // ---------------------------------------------------------------------------
 
-// snapshotNet captures every piece of host network state SetupNAT/SetupGatewayRoutes
+// snapshotNet captures every piece of host network state setupNAT/setupGatewayRoutes
 // can touch, EXCEPT ip_forward (which has its own preserve-if-on semantics and is
 // asserted separately). Lines within each section are sorted so the comparison is
 // about set membership, not iptables/ip print order.
@@ -433,7 +433,7 @@ func stripVolatile(s string) string {
 
 // verifyNoLeaks asserts the test spawns no goroutine that outlives it — chiefly
 // the route-change monitor and its netlink watcher goroutines, which
-// TeardownGatewayRoutes must reap. Registered via t.Cleanup (not defer) and as
+// teardownGatewayRoutes must reap. Registered via t.Cleanup (not defer) and as
 // the FIRST thing each test does, so — t.Cleanup being LIFO — it runs LAST,
 // after every teardown/link-delete cleanup, once nothing legitimate is left
 // running. IgnoreCurrent snapshots pre-existing background goroutines (logging
@@ -452,7 +452,7 @@ func requireRoot(t *testing.T) {
 }
 
 // requireDefaultRoute skips if the host has no IPv4 default route, since
-// SetupGatewayRoutes legitimately refuses to run without one.
+// setupGatewayRoutes legitimately refuses to run without one.
 func requireDefaultRoute(t *testing.T) {
 	t.Helper()
 	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)

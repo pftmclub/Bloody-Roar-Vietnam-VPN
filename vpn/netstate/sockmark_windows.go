@@ -38,7 +38,7 @@ const (
 	sweepInterval = 2 * time.Minute
 )
 
-// WindowsMarker binds libp2p (and SOCKS5 exit-node) sockets to the physical
+// windowsMarker binds libp2p (and SOCKS5 exit-node) sockets to the physical
 // uplink NIC via IP_UNICAST_IF / IPV6_UNICAST_IF so their traffic bypasses
 // the /1 gateway routes pointing into the TUN. Always on, like SO_MARK on
 // Linux: marking sockets from process start makes a later runtime gateway
@@ -55,7 +55,7 @@ const (
 //
 // The uplink is tracked per address family: on multihomed hosts the IPv6
 // default route may live on a different NIC than the IPv4 one.
-type WindowsMarker struct {
+type windowsMarker struct {
 	index4 atomic.Uint32
 	index6 atomic.Uint32
 
@@ -63,13 +63,13 @@ type WindowsMarker struct {
 	kickCh   chan struct{}
 }
 
-// New returns the Windows marker. The uplink indexes stay zero (marking is a
+// newMarker returns the Windows marker. The uplink indexes stay zero (marking is a
 // no-op) until Start performs the initial detection.
-func New() Marker {
-	return &WindowsMarker{kickCh: make(chan struct{}, 1)}
+func newMarker() marker {
+	return &windowsMarker{kickCh: make(chan struct{}, 1)}
 }
 
-func (m *WindowsMarker) FWMark() uint32 { return 0 }
+func (m *windowsMarker) FWMark() uint32 { return 0 }
 
 // Start synchronously detects the current uplink and launches the
 // network-change watcher, which lives until ctx is cancelled. An offline
@@ -77,7 +77,7 @@ func (m *WindowsMarker) FWMark() uint32 { return 0 }
 // picks the uplink up when connectivity appears and re-binds registered
 // sockets, so a restart is never needed. Only the change-notification
 // registration itself can fail.
-func (m *WindowsMarker) Start(ctx context.Context) error {
+func (m *windowsMarker) Start(ctx context.Context) error {
 	m.redetect()
 
 	routeCb, err := winipcfg.RegisterRouteChangeCallback(func(_ winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
@@ -119,14 +119,14 @@ func (m *WindowsMarker) Start(ctx context.Context) error {
 //
 // TODO(gateway-offline-start): soften this gate to a warning so gateway
 // client mode can be enabled/booted offline and self-heal when connectivity appears
-func (m *WindowsMarker) Ready() error {
+func (m *windowsMarker) Ready() error {
 	if m.index4.Load() == 0 {
 		return errors.New("no active network connection (no IPv4 default route)")
 	}
 	return nil
 }
 
-func (m *WindowsMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
+func (m *windowsMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	// Always return a closure, even while the uplink is unknown (index 0):
 	// the indexes are read on every invocation, so a late detection covers
 	// every socket created afterwards, and registered UDP sockets are
@@ -161,7 +161,7 @@ func (m *WindowsMarker) ControlFunc() func(network, address string, c syscall.Ra
 // Returns the Control-level error (dead socket — eviction signal for the
 // registry) separately from setsockopt errors (live socket, wrong option —
 // caller logs or fails the dial).
-func (m *WindowsMarker) apply(network, address string, c syscall.RawConn, reapply bool) (ctrlErr, sockErr error) {
+func (m *windowsMarker) apply(network, address string, c syscall.RawConn, reapply bool) (ctrlErr, sockErr error) {
 	idx4 := m.index4.Load()
 	idx6 := m.index6.Load()
 	v4, v6, confident := unicastIFFamilies(network, address)
@@ -198,7 +198,7 @@ func (m *WindowsMarker) apply(network, address string, c syscall.RawConn, reappl
 
 // kick schedules a debounced uplink re-detection. Non-blocking: called from
 // OS notification threads.
-func (m *WindowsMarker) kick() {
+func (m *windowsMarker) kick() {
 	select {
 	case m.kickCh <- struct{}{}:
 	default:
@@ -216,7 +216,7 @@ func (m *WindowsMarker) kick() {
 // changes). Add a hostnet-style test — Start → socket via ControlFunc →
 // mutate default routes → assert getsockopt(IP_UNICAST_IF) — after the
 // monitor moves into the netstate manager
-func (m *WindowsMarker) watch(ctx context.Context, cleanup func()) {
+func (m *windowsMarker) watch(ctx context.Context, cleanup func()) {
 	defer cleanup()
 
 	coalesce := time.NewTimer(time.Hour)
@@ -272,7 +272,7 @@ func (m *WindowsMarker) watch(ctx context.Context, cleanup func()) {
 
 // redetect recomputes both uplink indexes and, on change, re-binds every
 // registered socket.
-func (m *WindowsMarker) redetect() {
+func (m *windowsMarker) redetect() {
 	idx4, idx6 := detectUplinkIndexes()
 	old4 := m.index4.Swap(idx4)
 	old6 := m.index6.Swap(idx6)
@@ -286,7 +286,7 @@ func (m *WindowsMarker) redetect() {
 
 // reapply re-binds all registered sockets to the current indexes. Sockets
 // whose fd is dead (Control fails) are evicted.
-func (m *WindowsMarker) reapply() {
+func (m *windowsMarker) reapply() {
 	m.registry.forEachLive(func(e *registryEntry) error {
 		ctrlErr, sockErr := m.apply(e.network, e.address, e.conn, true)
 		if sockErr != nil {

@@ -34,8 +34,8 @@ const (
 	tunRouteMetric = 5
 )
 
-// RouteState holds the state needed to teardown gateway routes.
-type RouteState struct {
+// routeState holds the state needed to teardown gateway routes.
+type routeState struct {
 	tunLinkIndex int
 	fwmark       uint32
 
@@ -63,7 +63,7 @@ type RouteState struct {
 	v6UnreachAdded bool
 
 	// Route-change monitor lifecycle. monitorDone is closed by
-	// TeardownGatewayRoutes to stop the monitor; monitorWG waits for the
+	// teardownGatewayRoutes to stop the monitor; monitorWG waits for the
 	// goroutine to finish before teardown mutates tableID. Both are zero/nil when
 	// no monitor is running (e.g. a rollback before startRouteMonitor).
 	// stopping is set just before monitorDone is closed so the subscription's
@@ -74,7 +74,7 @@ type RouteState struct {
 	stopping    atomic.Bool
 }
 
-// SetupGatewayRoutes configures the system to route all traffic through the
+// setupGatewayRoutes configures the system to route all traffic through the
 // TUN interface, while exempting marked (libp2p) sockets via policy routing.
 //
 // Steps:
@@ -87,11 +87,11 @@ type RouteState struct {
 //     selection; teardown only deletes this added route, leaving the
 //     pre-existing defaults untouched.
 //
-// If a previous run was killed before TeardownGatewayRoutes could complete,
+// If a previous run was killed before teardownGatewayRoutes could complete,
 // the rule and tableID entries may still be present; cleanupStaleRoutes
 // removes those leftovers best-effort before we proceed. The TUN default
 // route itself is not subject to spec-cleanup — see cleanupStaleRoutes.
-func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
+func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	tunLink, err := netlink.LinkByName(tunIfName)
 	if err != nil {
 		return nil, fmt.Errorf("find TUN interface %s: %w", tunIfName, err)
@@ -125,7 +125,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 		return nil, fmt.Errorf("no IPv4 default route present, cannot configure VPN gateway")
 	}
 
-	state := &RouteState{
+	state := &routeState{
 		tunLinkIndex: tunLink.Attrs().Index,
 		fwmark:       fwmark,
 		origDefaults: origDefaults,
@@ -142,7 +142,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 		tableRoute := origDefaults[i]
 		tableRoute.Table = tableID
 		if err := netlink.RouteAdd(&tableRoute); err != nil {
-			_ = TeardownGatewayRoutes(state)
+			_ = teardownGatewayRoutes(state)
 			return nil, fmt.Errorf("add original default to table %d: %w", tableID, err)
 		}
 	}
@@ -157,7 +157,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 	// (dhclient/OpenVPN/admin scripts can all land on similar values), so
 	// we surface a clear diagnostic and let the operator resolve it.
 	if err := netlink.RouteAdd(buildTunDefaultRoute(tunLink.Attrs().Index)); err != nil {
-		_ = TeardownGatewayRoutes(state)
+		_ = teardownGatewayRoutes(state)
 		if errors.Is(err, syscall.EEXIST) {
 			return nil, fmt.Errorf("add TUN default route: %w — possible leftover from a prior awl run, "+
 				"inspect with `ip route show default` and remove with `ip route del default metric %d` if it is stale",
@@ -171,7 +171,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 	// unconditionally — see setupIPv6Fence for why that is safe even when IPv6 is
 	// disabled via sysctl, and how a genuinely absent IPv6 stack is tolerated.
 	if err := setupIPv6Fence(state, fwmark); err != nil {
-		_ = TeardownGatewayRoutes(state)
+		_ = teardownGatewayRoutes(state)
 		return nil, err
 	}
 
@@ -206,7 +206,7 @@ func SetupGatewayRoutes(tunIfName string, fwmark uint32) (*RouteState, error) {
 // fail with EAFNOSUPPORT, and there is nothing to leak. We detect that from the
 // netlink ops and skip the fence (leaving state.v6* unset) rather than failing
 // the otherwise-working IPv4 gateway setup.
-func setupIPv6Fence(state *RouteState, fwmark uint32) error {
+func setupIPv6Fence(state *routeState, fwmark uint32) error {
 	origDefaultsV6, err := getDefaultRoutesV6()
 	if err != nil {
 		if ipv6Unavailable(err) {
@@ -255,7 +255,7 @@ func ipv6Unavailable(err error) bool {
 	return errors.Is(err, syscall.EAFNOSUPPORT) || errors.Is(err, syscall.EPROTONOSUPPORT)
 }
 
-// cleanupStaleRoutes removes leftover state from a previous SetupGatewayRoutes
+// cleanupStaleRoutes removes leftover state from a previous setupGatewayRoutes
 // call: the fwmark→tableID ip rule and every route currently in tableID. All
 // errors are intentionally swallowed — this is a best-effort pre-clean before
 // the real adds, not a fully accountable teardown.
@@ -316,8 +316,8 @@ func cleanupStaleRoutes(fwmark uint32) bool {
 	return cleaned
 }
 
-// TeardownGatewayRoutes reverses the changes made by SetupGatewayRoutes.
-func TeardownGatewayRoutes(state *RouteState) error {
+// teardownGatewayRoutes reverses the changes made by setupGatewayRoutes.
+func teardownGatewayRoutes(state *routeState) error {
 	if state == nil {
 		return nil
 	}
@@ -530,8 +530,8 @@ const routeMonitorResubscribeBackoff = 1 * time.Second
 // exemption copies in sync with the live host default(s). Best-effort: if the
 // netlink subscription can't be established the gateway still works, only
 // staleness tracking is disabled. Call exactly once, at the end of a successful
-// SetupGatewayRoutes.
-func (s *RouteState) startRouteMonitor() {
+// setupGatewayRoutes.
+func (s *routeState) startRouteMonitor() {
 	teardownDone := make(chan struct{})
 	subDone := make(chan struct{})
 	updates, err := s.subscribeRouteUpdates(subDone)
@@ -556,7 +556,7 @@ func (s *RouteState) startRouteMonitor() {
 // channel on any receive error, which the consumer treats as "subscription died".
 // The ErrorCallback stays quiet once s.stopping is set: tearing our own socket
 // down provokes a benign "Receive failed" that is not worth logging.
-func (s *RouteState) subscribeRouteUpdates(subDone <-chan struct{}) (chan netlink.RouteUpdate, error) {
+func (s *routeState) subscribeRouteUpdates(subDone <-chan struct{}) (chan netlink.RouteUpdate, error) {
 	updates := make(chan netlink.RouteUpdate, 64)
 	opts := netlink.RouteSubscribeOptions{
 		ListExisting: false,
@@ -576,7 +576,7 @@ func (s *RouteState) subscribeRouteUpdates(subDone <-chan struct{}) (chan netlin
 // stopRouteMonitor signals the monitor to stop and blocks until it has exited,
 // guaranteeing the caller exclusive access to the tableID state afterwards.
 // Idempotent and safe when no monitor is running.
-func (s *RouteState) stopRouteMonitor() {
+func (s *routeState) stopRouteMonitor() {
 	if s.monitorDone == nil {
 		return
 	}
@@ -597,7 +597,7 @@ func (s *RouteState) stopRouteMonitor() {
 // subDone is the live subscription's cancel channel. It is closed (and replaced)
 // on every re-subscription and once more on exit, so no dead subscription's
 // socket or watcher goroutine outlives the event that killed it.
-func (s *RouteState) runRouteMonitor(updates <-chan netlink.RouteUpdate, subDone chan struct{}, teardownDone <-chan struct{}) {
+func (s *routeState) runRouteMonitor(updates <-chan netlink.RouteUpdate, subDone chan struct{}, teardownDone <-chan struct{}) {
 	defer s.monitorWG.Done()
 	// Tears down whichever subscription is live when we exit. The closure reads
 	// the current subDone, which the loop reassigns on each re-subscription.
@@ -644,7 +644,7 @@ func (s *RouteState) runRouteMonitor(updates <-chan netlink.RouteUpdate, subDone
 // teardownDone was closed (teardown) while waiting/retrying. All attempts share
 // subDone: a failed subscribe binds nothing, so reuse leaks nothing, and the one
 // that succeeds binds its socket to subDone for the caller to cancel later.
-func (s *RouteState) resubscribe(subDone <-chan struct{}, teardownDone <-chan struct{}) (<-chan netlink.RouteUpdate, bool) {
+func (s *routeState) resubscribe(subDone <-chan struct{}, teardownDone <-chan struct{}) (<-chan netlink.RouteUpdate, bool) {
 	for {
 		select {
 		case <-teardownDone:
@@ -666,7 +666,7 @@ func (s *RouteState) resubscribe(subDone <-chan struct{}, teardownDone <-chan st
 // default routes for both families. It NEVER touches the TUN default route or
 // the IPv6 unreachable fence (those are the static catch-all that guarantees no
 // leak) — it only adjusts the marked-libp2p exemption path.
-func (s *RouteState) reconcile() {
+func (s *routeState) reconcile() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -693,7 +693,7 @@ func (s *RouteState) reconcile() {
 // given family that belong in the exemption table, excluding awl's own routes
 // (the TUN default and the IPv6 unreachable fence) so we never copy them into
 // tableID — doing so would route marked sockets back into the TUN.
-func (s *RouteState) liveExemptionDefaults(family int) ([]netlink.Route, error) {
+func (s *routeState) liveExemptionDefaults(family int) ([]netlink.Route, error) {
 	var (
 		all []netlink.Route
 		err error
@@ -725,7 +725,7 @@ func (s *RouteState) liveExemptionDefaults(family int) ([]netlink.Route, error) 
 // desired live set (both keyed by routeKey) and applies the delta to tableID:
 // removing copies whose default disappeared and adding copies for defaults that
 // appeared. current is updated to desired. Must hold s.mu.
-func (s *RouteState) reconcileTableLocked(current *[]netlink.Route, desired []netlink.Route, family string) {
+func (s *routeState) reconcileTableLocked(current *[]netlink.Route, desired []netlink.Route, family string) {
 	oldByKey := make(map[string]netlink.Route, len(*current))
 	for _, r := range *current {
 		oldByKey[routeKey(r)] = r

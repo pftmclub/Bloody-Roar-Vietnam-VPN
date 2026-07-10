@@ -16,28 +16,28 @@ const awlForwardChain = "AWL-FORWARD"
 // privateSubnets (the destination set we refuse to forward) is shared across
 // platforms — see private_subnets.go.
 
-// NATState holds the state needed to teardown NAT rules.
+// natState holds the state needed to teardown NAT rules.
 //
 // Backend note: rules are created via the system `iptables` binary. On modern
 // distros that resolves to iptables-nft; rules created against the legacy
 // backend by other software are invisible to it (and vice versa). The library
 // used here (coreos/go-iptables) does not bridge that gap.
-type NATState struct {
+type natState struct {
 	awlSubnet     string
 	tunIfName     string
 	origIPForward string
 }
 
-// SetupNAT enables IP forwarding and configures iptables MASQUERADE for the exit node.
+// setupNAT enables IP forwarding and configures iptables MASQUERADE for the exit node.
 // It uses a dedicated AWL-FORWARD chain so our rules' evaluation order is
 // independent of whatever already lives in FORWARD.
 //
-// If a previous run was killed before TeardownNAT could complete, leftover
+// If a previous run was killed before teardownNAT could complete, leftover
 // state (AWL-FORWARD chain, MASQUERADE rule, ip_forward=1) would otherwise
 // cause this function to fail at NewChain. We pre-clean any such leftovers
 // best-effort so the new setup gets a clean slate.
-func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
-	state := &NATState{
+func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
+	state := &natState{
 		awlSubnet: awlSubnet,
 		tunIfName: tunIfName,
 	}
@@ -75,19 +75,19 @@ func SetupNAT(awlSubnet, tunIfName string) (*NATState, error) {
 		}
 	}
 
-	// From here on, any failure must invoke TeardownNAT so partial iptables
+	// From here on, any failure must invoke teardownNAT so partial iptables
 	// state is rolled back. teardownIptablesRules is idempotent (DeleteIfExists
 	// + ChainExists-gated clear/delete), so calling it on a half-built setup is
 	// safe.
 	if err := setupIptables(ipt, state); err != nil {
-		_ = TeardownNAT(state)
+		_ = teardownNAT(state)
 		return nil, err
 	}
 
 	return state, nil
 }
 
-func setupIptables(ipt *iptables.IPTables, state *NATState) error {
+func setupIptables(ipt *iptables.IPTables, state *natState) error {
 	if err := ipt.NewChain("filter", awlForwardChain); err != nil {
 		return fmt.Errorf("create chain %s: %w", awlForwardChain, err)
 	}
@@ -131,16 +131,16 @@ func setupIptables(ipt *iptables.IPTables, state *NATState) error {
 	return nil
 }
 
-// TeardownNAT reverses the changes made by SetupNAT. Safe to call on partially
+// teardownNAT reverses the changes made by setupNAT. Safe to call on partially
 // set up state.
-func TeardownNAT(state *NATState) error {
+func teardownNAT(state *natState) error {
 	if state == nil {
 		return nil
 	}
 
 	errs := teardownIptablesRules(state)
 
-	// Mirror of SetupNAT: we only enabled forwarding if it was off, so we only
+	// Mirror of setupNAT: we only enabled forwarding if it was off, so we only
 	// restore in that case. If it was already on, leave the kernel value alone.
 	if state.origIPForward == "0" {
 		if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("0"), 0600); err != nil {
@@ -151,7 +151,7 @@ func TeardownNAT(state *NATState) error {
 	return errors.Join(errs...)
 }
 
-func teardownIptablesRules(state *NATState) []error {
+func teardownIptablesRules(state *natState) []error {
 	var errs []error
 	ipt, err := iptables.New()
 	if err != nil {
@@ -184,7 +184,7 @@ func teardownIptablesRules(state *NATState) []error {
 	return errs
 }
 
-// cleanupStaleNAT removes leftover NAT state from a previous SetupNAT call
+// cleanupStaleNAT removes leftover NAT state from a previous setupNAT call
 // that did not get a clean teardown (kill -9, OOM, etc). Detection key is the
 // presence of the AWL-FORWARD chain — if it exists, we assume the rest of the
 // awl NAT scaffolding may also be present and try to remove it. All operations

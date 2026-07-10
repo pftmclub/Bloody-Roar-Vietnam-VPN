@@ -14,7 +14,6 @@ import (
 	"github.com/anywherelan/awl/config"
 	"github.com/anywherelan/awl/entity"
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 // DNSReconfigurer is the narrow slice of the DNS service the gateway needs to
@@ -27,16 +26,30 @@ type DNSReconfigurer interface {
 	ForceUpstreamDNS(enabled bool) error
 }
 
-// VPNGateway owns the runtime state for VPN gateway mode (both client and
-// server sides) — the OS-level routes / NAT / iptables, plus the lifecycle
-// glue that ties them to the persisted VPNGatewayConfig and the Tunnel's
-// runtime peer state.
+// NetManager is the slice of *netstate.Manager the gateway service needs: the
+// runtime apply/revert of the OS-level client routes and server NAT. All
+// methods are idempotent. Declared consumer-side so tests can substitute a
+// bookkeeping-only fake.
+type NetManager interface {
+	EnableClientRoutes(tunIfName string) error
+	DisableClientRoutes() error
+	ClientRoutesActive() bool
+	EnableServerNAT(awlSubnet, tunIfName string) error
+	DisableServerNAT() error
+	ServerNATActive() bool
+}
+
+// VPNGateway owns the lifecycle of VPN gateway mode (both client and server
+// sides): the glue that ties the OS-level state (applied via the netstate
+// manager) to the persisted VPNGatewayConfig and the Tunnel's runtime peer
+// state.
 //
-// Responsibility split with Tunnel:
+// Responsibility split:
 //   - Tunnel owns the packet-path state (gateway peer pointer, fwmark
 //     forwarding decisions, connectivity observation via p2p events).
-//   - VPNGateway owns OS-level state (routes, NAT) and the lifecycle methods
-//     called from the API and from Application.Init / Close.
+//   - The netstate manager owns the OS-level state itself (routes, NAT).
+//   - VPNGateway orchestrates: config, tunnel binding, DNS policy and the
+//     manager calls, from the API and from Application.Init / Close.
 //
 // VPNGateway calls into Tunnel for the runtime bind/unbind operations
 // (SetVPNGatewayPeer / ClearVPNGatewayPeer / SetVPNGatewayServerEnabled).
@@ -48,37 +61,29 @@ type VPNGateway struct {
 	tunnel     *Tunnel
 	device     *vpn.Device
 	p2p        P2p
-	sockMarker netstate.Marker
+	netManager NetManager
 	dns        DNSReconfigurer
 	logger     *log.ZapEventLogger
 
-	// disableOSSetup skips the netlink/iptables/route work in
-	// applyClient/applyServer, leaving only the in-process bookkeeping.
-	// Tests run without root and against a mock TUN that has no kernel
-	// netlink presence, so the real setup paths cannot run there.
-	disableOSSetup bool
-
-	// mu serialises apply/teardown across the API, startup and shutdown
-	// paths. Connectivity to the bound gateway peer is observed via p2p
-	// events inside Tunnel — no background goroutine here.
-	mu               sync.Mutex
-	clientRouteState *netstate.RouteState
-	serverNATState   *netstate.NATState
+	// mu serialises apply/teardown transactions (config + tunnel binding +
+	// DNS + manager calls) across the API, startup and shutdown paths.
+	// Connectivity to the bound gateway peer is observed via p2p events
+	// inside Tunnel — no background goroutine here.
+	mu sync.Mutex
 }
 
 // NewVPNGateway constructs a VPNGateway service. tunnel may be nil when the
 // VPN interface is disabled; the API methods still work but only update the
 // persisted config.
-func NewVPNGateway(conf *config.Config, tunnel *Tunnel, device *vpn.Device, p2p P2p, sockMarker netstate.Marker, dns DNSReconfigurer, disableOSSetup bool) *VPNGateway {
+func NewVPNGateway(conf *config.Config, tunnel *Tunnel, device *vpn.Device, p2p P2p, netManager NetManager, dns DNSReconfigurer) *VPNGateway {
 	return &VPNGateway{
-		conf:           conf,
-		tunnel:         tunnel,
-		device:         device,
-		p2p:            p2p,
-		sockMarker:     sockMarker,
-		dns:            dns,
-		disableOSSetup: disableOSSetup,
-		logger:         log.Logger("awl/service/vpn_gateway"),
+		conf:       conf,
+		tunnel:     tunnel,
+		device:     device,
+		p2p:        p2p,
+		netManager: netManager,
+		dns:        dns,
+		logger:     log.Logger("awl/service/vpn_gateway"),
 	}
 }
 
@@ -154,7 +159,7 @@ func (g *VPNGateway) ListAvailableVPNGateways() []entity.AvailableVPNGateway {
 // gateway, applying OS-level routes immediately. Atomic: rolls back the
 // tunnel binding on apply failure.
 //
-// On android the OS-level apply (netstate.SetupGatewayRoutes / sockmark) is a
+// On android the OS-level apply (the netstate manager's routes / marking) is a
 // no-op — routing is owned by the host's VpnService.Builder. This call flips
 // the in-memory tunnel binding and persists config; the host then re-establishes
 // the VpnService with the new routes and hot-swaps the fresh tun fd into the
@@ -281,26 +286,13 @@ func (g *VPNGateway) TeardownAtShutdown() {
 // this — the canonical "is gateway on" signal is config.VPNGateway.ClientEnabled
 // or PeerInfo.VPNGateway.
 func (g *VPNGateway) IsClientActive() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.clientRouteState != nil
+	return g.netManager.ClientRoutesActive()
 }
 
 // IsServerActive reports whether VPN gateway server NAT is currently installed.
 // Test-friendly accessor.
 func (g *VPNGateway) IsServerActive() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.serverNATState != nil
-}
-
-// ClientRouteState returns the current route state pointer (or nil). For
-// tests that need pointer-identity comparisons (idempotent re-enable must
-// not reinstall routes).
-func (g *VPNGateway) ClientRouteState() *netstate.RouteState {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.clientRouteState
+	return g.netManager.ServerNATActive()
 }
 
 // applyServer brings up VPN gateway server NAT (iptables MASQUERADE +
@@ -310,7 +302,7 @@ func (g *VPNGateway) applyServer() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.serverNATState != nil {
+	if g.netManager.ServerNATActive() {
 		return nil
 	}
 	if err := VPNGatewayServerSupported(); err != nil {
@@ -318,12 +310,6 @@ func (g *VPNGateway) applyServer() error {
 	}
 	if g.device == nil {
 		return fmt.Errorf("VPN interface is disabled, cannot serve as gateway")
-	}
-	if g.disableOSSetup {
-		// Keep state tracking working (so teardown is symmetric) without
-		// touching the kernel.
-		g.serverNATState = &netstate.NATState{}
-		return nil
 	}
 
 	tunName, err := g.device.InterfaceName()
@@ -333,11 +319,9 @@ func (g *VPNGateway) applyServer() error {
 	localIP, netMask := g.conf.VPNLocalIPMask()
 	awlSubnet := (&net.IPNet{IP: localIP.Mask(netMask), Mask: netMask}).String()
 
-	natState, err := netstate.SetupNAT(awlSubnet, tunName)
-	if err != nil {
-		return fmt.Errorf("setup NAT: %w", err)
+	if err := g.netManager.EnableServerNAT(awlSubnet, tunName); err != nil {
+		return err
 	}
-	g.serverNATState = natState
 	g.logger.Infof("VPN gateway server NAT configured for subnet %s on %s", awlSubnet, tunName)
 	return nil
 }
@@ -347,15 +331,9 @@ func (g *VPNGateway) teardownServer() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.serverNATState == nil {
-		return
+	if err := g.netManager.DisableServerNAT(); err != nil {
+		g.logger.Errorf("teardown NAT: %v", err)
 	}
-	if !g.disableOSSetup {
-		if err := netstate.TeardownNAT(g.serverNATState); err != nil {
-			g.logger.Errorf("teardown NAT: %v", err)
-		}
-	}
-	g.serverNATState = nil
 }
 
 // applyClient installs the policy-routing rules + TUN default route. The
@@ -385,37 +363,16 @@ func (g *VPNGateway) applyClient() error {
 		return fmt.Errorf("invalid VPN gateway peer ID %q: %w", gatewayPeerIDStr, err)
 	}
 
-	if g.clientRouteState != nil {
+	if g.netManager.ClientRoutesActive() {
 		return nil
 	}
 
-	// TODO: Temporary exception rather than a restructure: this branching moves into
-	//  the netstate manager in the next MR and flattens there.
-	//nolint:nestif
-	if g.disableOSSetup {
-		g.clientRouteState = &netstate.RouteState{}
-	} else {
-		// Markers that can be temporarily unable to guarantee loop-free
-		// marking (Windows: no uplink detected right now) expose Ready.
-		// The condition is self-healing — the marker re-binds sockets when
-		// connectivity appears — so this is "try again once online", not a
-		// permanent failure. Other platforms don't implement the interface
-		// and skip the check.
-		if readier, ok := g.sockMarker.(interface{ Ready() error }); ok {
-			if err := readier.Ready(); err != nil {
-				return fmt.Errorf("cannot enable VPN gateway: %w", err)
-			}
-		}
-
-		tunName, err := g.device.InterfaceName()
-		if err != nil {
-			return fmt.Errorf("get TUN name for gateway routes: %w", err)
-		}
-		routeState, err := netstate.SetupGatewayRoutes(tunName, g.sockMarker.FWMark())
-		if err != nil {
-			return fmt.Errorf("setup gateway routes: %w", err)
-		}
-		g.clientRouteState = routeState
+	tunName, err := g.device.InterfaceName()
+	if err != nil {
+		return fmt.Errorf("get TUN name for gateway routes: %w", err)
+	}
+	if err := g.netManager.EnableClientRoutes(tunName); err != nil {
+		return err
 	}
 
 	// Route all DNS through the tunnel to prevent leaks. Done after routes are
@@ -441,15 +398,15 @@ func (g *VPNGateway) teardownClient() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.clientRouteState == nil {
+	// The active check keeps teardown symmetric with applyClient: when no
+	// routes were installed, DNS was never forced upstream either, so don't
+	// touch it.
+	if !g.netManager.ClientRoutesActive() {
 		return
 	}
-	if !g.disableOSSetup {
-		if err := netstate.TeardownGatewayRoutes(g.clientRouteState); err != nil {
-			g.logger.Errorf("teardown gateway routes: %v", err)
-		}
+	if err := g.netManager.DisableClientRoutes(); err != nil {
+		g.logger.Errorf("teardown gateway routes: %v", err)
 	}
-	g.clientRouteState = nil
 
 	// Restore normal DNS (split-DNS / system resolver). No-op when DNS is not
 	// active as the system resolver.
