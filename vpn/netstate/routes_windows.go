@@ -35,10 +35,7 @@ type routeState struct {
 // kill -9 they die with the Wintun adapter — fail-open until restart for both
 // families (on Linux the v6 fence survives a crash; Windows is weaker here,
 // documented in GATEWAY_FEATURE.md).
-//
-// fwmark is unused on Windows — sockets are bound to the physical interface
-// via IP_UNICAST_IF; see sockmark_windows.go.
-func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
+func (m *Manager) setupGatewayRoutes(tunIfName string) (*routeState, error) {
 	luid, err := luidFromGUIDName(tunIfName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve TUN interface: %w", err)
@@ -54,7 +51,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	}
 	for _, prefix := range v4Prefixes {
 		if err := state.addTunRoute(prefix, netip.IPv4Unspecified()); err != nil {
-			_ = teardownGatewayRoutes(state)
+			_ = m.teardownGatewayRoutes(state)
 			return nil, err
 		}
 	}
@@ -76,7 +73,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 		}
 		// v6 exists on the adapter but the fence could not be installed —
 		// continuing would silently leak IPv6 around the gateway.
-		_ = teardownGatewayRoutes(state)
+		_ = m.teardownGatewayRoutes(state)
 		return nil, fmt.Errorf("install IPv6 fail-closed fence: %w", err)
 	}
 
@@ -119,7 +116,7 @@ func tunHasIPv6(luid winipcfg.LUID) bool {
 }
 
 // teardownGatewayRoutes removes the routes added by setupGatewayRoutes.
-func teardownGatewayRoutes(state *routeState) error {
+func (m *Manager) teardownGatewayRoutes(state *routeState) error {
 	if state == nil {
 		return nil
 	}

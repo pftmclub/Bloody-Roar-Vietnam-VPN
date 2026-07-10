@@ -2,11 +2,11 @@
 
 // Package netstate host-network integration tests.
 //
-// These tests exercise the real Linux netfilter / netlink plumbing
-// (setupNAT/teardownNAT and setupGatewayRoutes/teardownGatewayRoutes) against
-// the *actual* host network: they create a dummy `awl0` link, install ip rules,
-// iptables chains and routes, and assert they are applied and then fully torn
-// down.
+// These tests exercise the real Linux netfilter / netlink plumbing behind
+// Manager (EnableServerNAT/DisableServerNAT and
+// EnableClientRoutes/DisableClientRoutes) against the *actual* host network:
+// they create a dummy `awl0` link, install ip rules, iptables chains and
+// routes, and assert they are applied and then fully torn down.
 //
 // They are DANGEROUS by nature — while a test is mid-flight the host has a
 // default route pointed at a dead dummy interface, i.e. its egress is a black
@@ -53,8 +53,6 @@ const (
 	ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
 )
 
-func testFWMark() uint32 { return newMarker().FWMark() }
-
 // ---- N1: NAT apply/teardown lifecycle ----
 
 func TestGatewayHostNetNATLifecycle(t *testing.T) {
@@ -65,13 +63,15 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state, err := setupNAT(testAwlSubnet, testTunIf)
-	require.NoError(t, err)
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, testTunIf))
+	require.True(t, mgr.ServerNATActive())
 
 	assertNATApplied(t)
 	require.Equal(t, "1", readForward(t), "ip_forward must be on while NAT is up")
 
-	require.NoError(t, teardownNAT(state))
+	require.NoError(t, mgr.DisableServerNAT())
+	require.False(t, mgr.ServerNATActive())
 
 	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup netfilter state")
 	require.Equal(t, origForward, readForward(t),
@@ -80,9 +80,12 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 
 // ---- N2: NAT re-setup is idempotent (kill -9 recovery) ----
 //
-// A second setupNAT without a teardown in between is exactly what happens after
-// a crash: cleanupStaleNAT must recover the leftover scaffolding so NewChain
-// succeeds and the resulting state is identical to a single clean setup.
+// A second manager enabling NAT over the live state of a first one is exactly
+// what happens after a crash (the first manager died with its process without
+// a teardown): cleanupStaleNAT must recover the leftover scaffolding so
+// NewChain succeeds and the resulting state is identical to a single clean
+// setup. A second Enable on the SAME manager would be short-circuited by the
+// Manager-level idempotency, so a fresh instance is required here.
 
 func TestGatewayHostNetNATIdempotentResetup(t *testing.T) {
 	verifyNoLeaks(t)
@@ -92,19 +95,20 @@ func TestGatewayHostNetNATIdempotentResetup(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	_, err := setupNAT(testAwlSubnet, testTunIf)
-	require.NoError(t, err)
+	mgr1 := NewManager()
+	require.NoError(t, mgr1.EnableServerNAT(testAwlSubnet, testTunIf))
 	applied1 := snapshotNet(t)
 
-	// Second setup over the live state of the first — simulates a leftover from
-	// a process that was killed before teardownNAT ran.
-	state2, err := setupNAT(testAwlSubnet, testTunIf)
-	require.NoError(t, err, "re-setup over leftover state must succeed (cleanupStaleNAT)")
+	// Second manager over the live state of the first — simulates a leftover
+	// from a process that was killed before teardown ran.
+	mgr2 := NewManager()
+	require.NoError(t, mgr2.EnableServerNAT(testAwlSubnet, testTunIf),
+		"re-setup over leftover state must succeed (cleanupStaleNAT)")
 	applied2 := snapshotNet(t)
 
 	require.Equal(t, applied1, applied2, "re-setup must produce identical state, no duplicate rules")
 
-	require.NoError(t, teardownNAT(state2))
+	require.NoError(t, mgr2.DisableServerNAT())
 	require.Equal(t, before, snapshotNet(t), "single teardown must clean everything after a re-setup")
 }
 
@@ -120,11 +124,11 @@ func TestGatewayHostNetNATPreservesExistingIPForward(t *testing.T) {
 		t.Skip("ip_forward is not already on; this case needs a host where it was pre-enabled (e.g. Docker)")
 	}
 
-	state, err := setupNAT(testAwlSubnet, testTunIf)
-	require.NoError(t, err)
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, testTunIf))
 	require.Equal(t, "1", readForward(t))
 
-	require.NoError(t, teardownNAT(state))
+	require.NoError(t, mgr.DisableServerNAT())
 	require.Equal(t, "1", readForward(t),
 		"ip_forward was already on before setup; teardown must NOT reset it to 0")
 }
@@ -139,12 +143,14 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state, err := setupGatewayRoutes(testTunIf, testFWMark())
-	require.NoError(t, err)
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
+	require.True(t, mgr.ClientRoutesActive())
 
 	assertRoutesApplied(t)
 
-	require.NoError(t, teardownGatewayRoutes(state))
+	require.NoError(t, mgr.DisableClientRoutes())
+	require.False(t, mgr.ClientRoutesActive())
 	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup routing state")
 }
 
@@ -152,8 +158,8 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 //
 // Deleting the link drops the kernel default route via it (mirrors a real TUN
 // dying with its process), while the fwmark rule and the auxiliary-table copies
-// are orphaned. A fresh setupGatewayRoutes must clean those up (cleanupStaleRoutes)
-// and succeed without an EEXIST on the new TUN default.
+// are orphaned. A fresh manager's EnableClientRoutes must clean those up
+// (cleanupStaleRoutes) and succeed without an EEXIST on the new TUN default.
 
 func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 	verifyNoLeaks(t)
@@ -163,25 +169,26 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 
 	before := snapshotNet(t)
 
-	state1, err := setupGatewayRoutes(testTunIf, testFWMark())
-	require.NoError(t, err)
+	mgr1 := NewManager()
+	require.NoError(t, mgr1.EnableClientRoutes(testTunIf))
 	applied1 := snapshotNet(t)
 
 	// Simulate the crash: the first run's monitor goroutine would die with its
 	// process. Stop just the monitor (no OS teardown — the routes/rule/table are
 	// left orphaned on purpose for cleanupStaleRoutes to recover) before the
 	// recovery, so it neither leaks nor races the second setup.
-	state1.stopRouteMonitor()
+	mgr1.routeState.stopRouteMonitor()
 
 	// Simulate the TUN dying: deleting awl0 makes the kernel auto-remove the
 	// default route via it, leaving the fwmark rule + table copies orphaned.
 	recreateDummyTun(t)
 
-	state2, err := setupGatewayRoutes(testTunIf, testFWMark())
-	require.NoError(t, err, "re-setup must recover orphaned ip rule + table routes (cleanupStaleRoutes)")
+	mgr2 := NewManager()
+	require.NoError(t, mgr2.EnableClientRoutes(testTunIf),
+		"re-setup must recover orphaned ip rule + table routes (cleanupStaleRoutes)")
 	require.Equal(t, applied1, snapshotNet(t), "recovered state must match a clean single setup")
 
-	require.NoError(t, teardownGatewayRoutes(state2))
+	require.NoError(t, mgr2.DisableClientRoutes())
 	require.Equal(t, before, snapshotNet(t))
 }
 
@@ -190,7 +197,7 @@ func TestGatewayHostNetRoutesStaleRecovery(t *testing.T) {
 // cleanupStaleRoutes deliberately never deletes the TUN default route (no
 // reliable owner-tag; deleting by metric risks nuking dhclient/OpenVPN routes).
 // So when the link did NOT go away (here: a still-present dummy with the route
-// seeded), setupGatewayRoutes must surface a clear diagnostic instead of
+// seeded), EnableClientRoutes must surface a clear diagnostic instead of
 // duplicating or clobbering.
 
 func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
@@ -209,10 +216,12 @@ func TestGatewayHostNetRoutesLeftoverTunRouteErrors(t *testing.T) {
 	require.NoError(t, netlink.RouteAdd(leftover))
 	t.Cleanup(func() { _ = netlink.RouteDel(leftover) })
 
-	_, err = setupGatewayRoutes(testTunIf, testFWMark())
+	mgr := NewManager()
+	err = mgr.EnableClientRoutes(testTunIf)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "leftover from a prior awl run",
 		"a colliding TUN default must produce the operator-facing diagnostic")
+	require.False(t, mgr.ClientRoutesActive(), "a failed enable must leave the manager inactive")
 
 	require.NoError(t, netlink.RouteDel(leftover))
 	require.Equal(t, before, snapshotNet(t), "the failed setup must leave no partial state behind")
@@ -232,9 +241,9 @@ func TestGatewayHostNetRoutesStalenessReconcile(t *testing.T) {
 	requireDefaultRoute(t)
 	setupDummyTun(t)
 
-	state, err := setupGatewayRoutes(testTunIf, testFWMark())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = teardownGatewayRoutes(state) })
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
+	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
 
 	// A second dummy "uplink" with an on-link subnet and its own default route,
 	// at a high metric so it never competes with real egress or the TUN default.
@@ -287,9 +296,9 @@ func TestGatewayHostNetRoutesStalenessReconcileV6(t *testing.T) {
 	}
 	setupDummyTun(t)
 
-	state, err := setupGatewayRoutes(testTunIf, testFWMark())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = teardownGatewayRoutes(state) })
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
+	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
 
 	// A second dummy "uplink" with an on-link v6 subnet and its own v6 default,
 	// at a high metric so it never competes with real egress or the fence.
@@ -358,7 +367,7 @@ func assertRoutesApplied(t *testing.T) {
 	t.Helper()
 
 	rules := cmdOut(t, "ip", "rule", "show")
-	require.Contains(t, rules, fmt.Sprintf("fwmark 0x%x", testFWMark()), "fwmark ip rule")
+	require.Contains(t, rules, fmt.Sprintf("fwmark 0x%x", awlMark), "fwmark ip rule")
 	require.Contains(t, rules, fmt.Sprintf("lookup %d", tableID), "ip rule must steer to the awl table")
 
 	main := cmdOut(t, "ip", "-4", "route", "show")
@@ -377,7 +386,7 @@ func assertRoutesApplied(t *testing.T) {
 		return
 	}
 	rules6 := cmdOut(t, "ip", "-6", "rule", "show")
-	require.Contains(t, rules6, fmt.Sprintf("fwmark 0x%x", testFWMark()), "v6 fwmark ip rule")
+	require.Contains(t, rules6, fmt.Sprintf("fwmark 0x%x", awlMark), "v6 fwmark ip rule")
 	require.Contains(t, rules6, fmt.Sprintf("lookup %d", tableID), "v6 ip rule must steer to the awl table")
 
 	// Anchor the metric to the unreachable line so an unrelated host route can't

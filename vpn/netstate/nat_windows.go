@@ -3,6 +3,8 @@
 package netstate
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -17,6 +19,9 @@ import (
 const (
 	wfpSublayerName = "awl-gateway"
 	wfpRuleName     = "awl-gateway: block forwarded LAN/CGNAT egress from TUN"
+
+	// winNATName is the name of the WinNAT instance owned by awl.
+	winNATName = "awl-gateway"
 )
 
 // natState holds the state needed to teardown NAT on Windows.
@@ -47,7 +52,7 @@ type natState struct {
 // Order matters and is fail-closed: the WFP BLOCK filter is installed before
 // forwarding/NAT create any technical possibility of transit. Any failure
 // after the first step rolls back via teardownNAT (all steps are idempotent).
-func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
+func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	awlPrefix, err := netip.ParsePrefix(awlSubnet)
 	if err != nil {
 		return nil, fmt.Errorf("parse awl subnet %q: %w", awlSubnet, err)
@@ -77,7 +82,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 
 	// 1. WFP forward-layer BLOCK — the safety fence goes up first.
 	if err := setupWFP(state, tunIfIndex, awlPrefix); err != nil {
-		_ = teardownNAT(state)
+		_ = m.teardownNAT(state)
 		return nil, fmt.Errorf("setup WFP filter: %w", err)
 	}
 
@@ -96,7 +101,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	forwardingTargets := []winipcfg.LUID{tunLUID}
 	route, ok, err := bestUplinkDefault(windows.AF_INET, tunLUID)
 	if err != nil {
-		_ = teardownNAT(state)
+		_ = m.teardownNAT(state)
 		return nil, fmt.Errorf("detect uplink for forwarding: %w", err)
 	}
 	if ok {
@@ -108,7 +113,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	for _, luid := range forwardingTargets {
 		enabledByUs, err := enableIPv4Forwarding(luid)
 		if err != nil {
-			_ = teardownNAT(state)
+			_ = m.teardownNAT(state)
 			return nil, fmt.Errorf("enable forwarding on interface %d: %w", luid, err)
 		}
 		if enabledByUs {
@@ -119,7 +124,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	// 3. WinNAT instance — transit becomes possible only now, with the WFP
 	// fence already in place.
 	if err := createWinNAT(awlSubnet); err != nil {
-		_ = teardownNAT(state)
+		_ = m.teardownNAT(state)
 		return nil, err
 	}
 	state.natCreated = true
@@ -131,7 +136,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 // transit dies), then forwarding (LAN transit dies), then the WFP session —
 // the protection is removed last, when transit is no longer possible. Errors
 // are collected; teardown proceeds through all steps. Safe on partial state.
-func teardownNAT(state *natState) error {
+func (m *Manager) teardownNAT(state *natState) error {
 	if state == nil {
 		return nil
 	}
@@ -301,6 +306,45 @@ func runPowerShell(command string) ([]byte, error) {
 		return out, fmt.Errorf("powershell %q: %w (output: %s)", command, err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
+}
+
+// netNATEntry is one WinNAT instance as reported by
+// `Get-NetNat | ConvertTo-Json`.
+type netNATEntry struct {
+	Name                             string `json:"Name"`
+	InternalIPInterfaceAddressPrefix string `json:"InternalIPInterfaceAddressPrefix"`
+}
+
+// parseNetNATJSON parses `Get-NetNat | ConvertTo-Json -Compress` output.
+// PowerShell emits nothing for an empty result, a single JSON object for one
+// instance, and a JSON array for several — all three shapes are handled.
+func parseNetNATJSON(data []byte) ([]netNATEntry, error) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if data[0] == '[' {
+		var entries []netNATEntry
+		if err := json.Unmarshal(data, &entries); err != nil {
+			return nil, fmt.Errorf("parse Get-NetNat JSON array: %w", err)
+		}
+		return entries, nil
+	}
+	var entry netNATEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, fmt.Errorf("parse Get-NetNat JSON object: %w", err)
+	}
+	return []netNATEntry{entry}, nil
+}
+
+// findNetNAT returns the entry with the given name, if present.
+func findNetNAT(entries []netNATEntry, name string) (netNATEntry, bool) {
+	for _, e := range entries {
+		if e.Name == name {
+			return e, true
+		}
+	}
+	return netNATEntry{}, false
 }
 
 // listNetNAT returns the current WinNAT instances.

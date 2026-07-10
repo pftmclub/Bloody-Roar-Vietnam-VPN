@@ -19,7 +19,8 @@ import (
 // closed socket returns an error ("use of closed network connection"), which
 // is the eviction signal.
 //
-// Kept free of build tags so the logic is unit-tested on every platform.
+// Windows-only because only the Windows marker needs re-binding;
+// the logic itself is OS-agnostic and unit-tested with fake RawConns.
 type sockRegistry struct {
 	mu      sync.Mutex
 	entries map[*registryEntry]struct{}

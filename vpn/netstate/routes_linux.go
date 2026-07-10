@@ -37,7 +37,6 @@ const (
 // routeState holds the state needed to teardown gateway routes.
 type routeState struct {
 	tunLinkIndex int
-	fwmark       uint32
 
 	// mu guards origDefaults / origDefaultsV6, which the route-change monitor
 	// rewrites when the host default changes mid-session (see runRouteMonitor).
@@ -91,7 +90,7 @@ type routeState struct {
 // the rule and tableID entries may still be present; cleanupStaleRoutes
 // removes those leftovers best-effort before we proceed. The TUN default
 // route itself is not subject to spec-cleanup — see cleanupStaleRoutes.
-func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
+func (m *Manager) setupGatewayRoutes(tunIfName string) (*routeState, error) {
 	tunLink, err := netlink.LinkByName(tunIfName)
 	if err != nil {
 		return nil, fmt.Errorf("find TUN interface %s: %w", tunIfName, err)
@@ -100,7 +99,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	// Best-effort removal of leftovers from a previous run. Done before we
 	// snapshot original defaults so that the leftover tableID contents don't
 	// mask the user's true main-table state.
-	if cleaned := cleanupStaleRoutes(fwmark); cleaned {
+	if cleaned := cleanupStaleRoutes(); cleaned {
 		logger.Warnf("recovered from leftover gateway route state (previous run was likely killed before teardown)")
 	}
 
@@ -127,12 +126,11 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 
 	state := &routeState{
 		tunLinkIndex: tunLink.Attrs().Index,
-		fwmark:       fwmark,
 		origDefaults: origDefaults,
 	}
 
 	// 1. Add ip rule: marked packets use tableID.
-	if err := netlink.RuleAdd(buildFwmarkRule(fwmark)); err != nil {
+	if err := netlink.RuleAdd(buildFwmarkRule()); err != nil {
 		return nil, fmt.Errorf("add ip rule: %w", err)
 	}
 
@@ -142,7 +140,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 		tableRoute := origDefaults[i]
 		tableRoute.Table = tableID
 		if err := netlink.RouteAdd(&tableRoute); err != nil {
-			_ = teardownGatewayRoutes(state)
+			_ = m.teardownGatewayRoutes(state)
 			return nil, fmt.Errorf("add original default to table %d: %w", tableID, err)
 		}
 	}
@@ -157,7 +155,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	// (dhclient/OpenVPN/admin scripts can all land on similar values), so
 	// we surface a clear diagnostic and let the operator resolve it.
 	if err := netlink.RouteAdd(buildTunDefaultRoute(tunLink.Attrs().Index)); err != nil {
-		_ = teardownGatewayRoutes(state)
+		_ = m.teardownGatewayRoutes(state)
 		if errors.Is(err, syscall.EEXIST) {
 			return nil, fmt.Errorf("add TUN default route: %w — possible leftover from a prior awl run, "+
 				"inspect with `ip route show default` and remove with `ip route del default metric %d` if it is stale",
@@ -170,8 +168,8 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 	// IPv6 fail-closed fence (`unreachable ::/0` + libp2p exemption). Installed
 	// unconditionally — see setupIPv6Fence for why that is safe even when IPv6 is
 	// disabled via sysctl, and how a genuinely absent IPv6 stack is tolerated.
-	if err := setupIPv6Fence(state, fwmark); err != nil {
-		_ = teardownGatewayRoutes(state)
+	if err := setupIPv6Fence(state); err != nil {
+		_ = m.teardownGatewayRoutes(state)
 		return nil, err
 	}
 
@@ -206,7 +204,7 @@ func setupGatewayRoutes(tunIfName string, fwmark uint32) (*routeState, error) {
 // fail with EAFNOSUPPORT, and there is nothing to leak. We detect that from the
 // netlink ops and skip the fence (leaving state.v6* unset) rather than failing
 // the otherwise-working IPv4 gateway setup.
-func setupIPv6Fence(state *routeState, fwmark uint32) error {
+func setupIPv6Fence(state *routeState) error {
 	origDefaultsV6, err := getDefaultRoutesV6()
 	if err != nil {
 		if ipv6Unavailable(err) {
@@ -216,7 +214,7 @@ func setupIPv6Fence(state *routeState, fwmark uint32) error {
 		return fmt.Errorf("get IPv6 default routes: %w", err)
 	}
 
-	if err := netlink.RuleAdd(buildFwmarkRuleV6(fwmark)); err != nil {
+	if err := netlink.RuleAdd(buildFwmarkRuleV6()); err != nil {
 		if ipv6Unavailable(err) {
 			logger.Infof("IPv6 stack unavailable (%v); skipping IPv6 leak fence", err)
 			return nil
@@ -273,11 +271,11 @@ func ipv6Unavailable(err error) bool {
 //     or a system administrator's static route. Better to surface a clear
 //     error from RouteAdd's EEXIST than silently delete someone else's
 //     traffic path.
-func cleanupStaleRoutes(fwmark uint32) bool {
+func cleanupStaleRoutes() bool {
 	cleaned := false
 
 	// 1. Stale ip rule: fwmark → tableID.
-	if err := netlink.RuleDel(buildFwmarkRule(fwmark)); err == nil {
+	if err := netlink.RuleDel(buildFwmarkRule()); err == nil {
 		cleaned = true
 	}
 
@@ -306,7 +304,7 @@ func cleanupStaleRoutes(fwmark uint32) bool {
 	// so a SIGKILL'd run leaves it behind — fencing off IPv6 host-wide until it
 	// is removed. It IS owner-tagged (its low metric + ::/0 + RTN_UNREACHABLE
 	// shape is ours), so we clean it here rather than surfacing an EEXIST.
-	if err := netlink.RuleDel(buildFwmarkRuleV6(fwmark)); err == nil {
+	if err := netlink.RuleDel(buildFwmarkRuleV6()); err == nil {
 		cleaned = true
 	}
 	if err := netlink.RouteDel(buildV6UnreachableRoute()); err == nil {
@@ -317,7 +315,7 @@ func cleanupStaleRoutes(fwmark uint32) bool {
 }
 
 // teardownGatewayRoutes reverses the changes made by setupGatewayRoutes.
-func teardownGatewayRoutes(state *routeState) error {
+func (m *Manager) teardownGatewayRoutes(state *routeState) error {
 	if state == nil {
 		return nil
 	}
@@ -345,7 +343,7 @@ func teardownGatewayRoutes(state *routeState) error {
 		}
 	}
 
-	if err := netlink.RuleDel(buildFwmarkRule(state.fwmark)); err != nil {
+	if err := netlink.RuleDel(buildFwmarkRule()); err != nil {
 		errs = append(errs, fmt.Errorf("del ip rule: %w", err))
 	}
 
@@ -365,7 +363,7 @@ func teardownGatewayRoutes(state *routeState) error {
 		}
 	}
 	if state.v6RuleAdded {
-		if err := netlink.RuleDel(buildFwmarkRuleV6(state.fwmark)); err != nil {
+		if err := netlink.RuleDel(buildFwmarkRuleV6()); err != nil {
 			errs = append(errs, fmt.Errorf("del IPv6 ip rule: %w", err))
 		}
 	}
@@ -379,9 +377,9 @@ func teardownGatewayRoutes(state *routeState) error {
 // buildFwmarkRule constructs the ip rule used to steer fwmark-tagged packets
 // into tableID. Same shape is used for Add, Del (cleanup), and Del (teardown)
 // so they can't drift.
-func buildFwmarkRule(fwmark uint32) *netlink.Rule {
+func buildFwmarkRule() *netlink.Rule {
 	r := netlink.NewRule()
-	r.Mark = fwmark
+	r.Mark = awlMark
 	r.Table = tableID
 	r.Priority = rulePriority
 	r.Family = netlink.FAMILY_V4
@@ -392,9 +390,9 @@ func buildFwmarkRule(fwmark uint32) *netlink.Rule {
 // fwmark-tagged IPv6 packets (libp2p sockets) into tableID so they reach the
 // physical NIC instead of hitting the `unreachable ::/0` fence. SO_MARK is set
 // on every socket regardless of family, so the same fwmark value applies.
-func buildFwmarkRuleV6(fwmark uint32) *netlink.Rule {
+func buildFwmarkRuleV6() *netlink.Rule {
 	r := netlink.NewRule()
-	r.Mark = fwmark
+	r.Mark = awlMark
 	r.Table = tableID
 	r.Priority = rulePriority
 	r.Family = netlink.FAMILY_V6

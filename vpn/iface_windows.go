@@ -78,7 +78,12 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 }
 
 func (d *Device) InterfaceName() (string, error) {
-	nativeTun := d.tun.(*tun.NativeTun)
+	nativeTun, ok := d.tun.(*tun.NativeTun)
+	if !ok {
+		// Injected tun device (tests): no wintun LUID to resolve into a GUID,
+		// report the plain name like the other platforms do.
+		return d.tun.Name()
+	}
 	luid := winipcfg.LUID(nativeTun.LUID())
 	guid, err := luid.GUID()
 	if err != nil {

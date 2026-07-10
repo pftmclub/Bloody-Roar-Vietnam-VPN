@@ -1,5 +1,22 @@
 //go:build windows
 
+// Socket marking on Windows: this file holds the marking half of Manager.
+//
+// Manager binds libp2p (and SOCKS5 exit-node) sockets to the physical uplink
+// NIC via IP_UNICAST_IF / IPV6_UNICAST_IF so their traffic bypasses the /1
+// gateway routes pointing into the TUN. Always on, like SO_MARK on Linux:
+// marking sockets from process start makes a later runtime gateway enable
+// safe (already-open sockets are already bound to the uplink — no routing
+// loop).
+//
+// Unlike SO_MARK (interpreted by the kernel per packet), UNICAST_IF is frozen
+// into the socket, so long-lived sockets must be re-bound when the uplink
+// changes. Start (manager_windows.go) launches a watcher that re-detects the
+// uplink on network changes and re-applies the options across the registry of
+// live UDP sockets (the eternal QUIC sockets; established TCP cannot survive
+// an uplink change anyway — see sockRegistry). This is the same mechanism
+// userspace WireGuard for Windows used (defaultroutemonitor +
+// BindSocketToInterface4/6).
 package netstate
 
 import (
@@ -7,8 +24,9 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"net"
+	"net/netip"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,95 +56,10 @@ const (
 	sweepInterval = 2 * time.Minute
 )
 
-// windowsMarker binds libp2p (and SOCKS5 exit-node) sockets to the physical
-// uplink NIC via IP_UNICAST_IF / IPV6_UNICAST_IF so their traffic bypasses
-// the /1 gateway routes pointing into the TUN. Always on, like SO_MARK on
-// Linux: marking sockets from process start makes a later runtime gateway
-// enable safe (already-open sockets are already bound to the uplink — no
-// routing loop).
-//
-// Unlike SO_MARK (interpreted by the kernel per packet), UNICAST_IF is frozen
-// into the socket, so long-lived sockets must be re-bound when the uplink
-// changes. Start launches a watcher that re-detects the uplink on network
-// changes and re-applies the options across the registry of live UDP sockets
-// (the eternal QUIC sockets; established TCP cannot survive an uplink change
-// anyway — see sockRegistry). This is the same mechanism userspace WireGuard
-// for Windows used (defaultroutemonitor + BindSocketToInterface4/6).
-//
-// The uplink is tracked per address family: on multihomed hosts the IPv6
-// default route may live on a different NIC than the IPv4 one.
-type windowsMarker struct {
-	index4 atomic.Uint32
-	index6 atomic.Uint32
-
-	registry sockRegistry
-	kickCh   chan struct{}
-}
-
-// newMarker returns the Windows marker. The uplink indexes stay zero (marking is a
-// no-op) until Start performs the initial detection.
-func newMarker() marker {
-	return &windowsMarker{kickCh: make(chan struct{}, 1)}
-}
-
-func (m *windowsMarker) FWMark() uint32 { return 0 }
-
-// Start synchronously detects the current uplink and launches the
-// network-change watcher, which lives until ctx is cancelled. An offline
-// start (no default route → both indexes 0) is not an error: the watcher
-// picks the uplink up when connectivity appears and re-binds registered
-// sockets, so a restart is never needed. Only the change-notification
-// registration itself can fail.
-func (m *windowsMarker) Start(ctx context.Context) error {
-	m.redetect()
-
-	routeCb, err := winipcfg.RegisterRouteChangeCallback(func(_ winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
-		// Only default-route changes can change the uplink choice.
-		if route != nil && route.DestinationPrefix.PrefixLength == 0 {
-			m.kick()
-		}
-	})
-	if err != nil {
-		return fmt.Errorf("register route change callback: %w", err)
-	}
-	ifaceCb, err := winipcfg.RegisterInterfaceChangeCallback(func(notificationType winipcfg.MibNotificationType, _ *winipcfg.MibIPInterfaceRow) {
-		// Parameter changes cover interface metric flips, which reorder
-		// default routes without touching the route table itself.
-		if notificationType == winipcfg.MibParameterNotification {
-			m.kick()
-		}
-	})
-	if err != nil {
-		_ = routeCb.Unregister()
-		return fmt.Errorf("register interface change callback: %w", err)
-	}
-
-	go m.watch(ctx, func() {
-		_ = routeCb.Unregister()
-		_ = ifaceCb.Unregister()
-	})
-
-	logger.Infof("socket marker started (IPv4 uplink ifIndex %d, IPv6 uplink ifIndex %d)",
-		m.index4.Load(), m.index6.Load())
-	return nil
-}
-
-// Ready reports whether the marker currently knows an IPv4 uplink — the
-// prerequisite for enabling gateway client mode without a routing loop. The
-// condition is self-healing (the watcher re-binds sockets when connectivity
-// appears), so a failure here means "try again once online", not "restart".
-// IPv6 is not required: the tunnel is IPv4-only and gateway mode fences IPv6.
-//
-// TODO(gateway-offline-start): soften this gate to a warning so gateway
-// client mode can be enabled/booted offline and self-heal when connectivity appears
-func (m *windowsMarker) Ready() error {
-	if m.index4.Load() == 0 {
-		return errors.New("no active network connection (no IPv4 default route)")
-	}
-	return nil
-}
-
-func (m *windowsMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
+// ControlFunc returns a function compatible with net.Dialer.Control and the
+// QUIC ListenUDP override, binding each new socket to the current uplink so
+// its traffic bypasses the VPN tunnel.
+func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn) error {
 	// Always return a closure, even while the uplink is unknown (index 0):
 	// the indexes are read on every invocation, so a late detection covers
 	// every socket created afterwards, and registered UDP sockets are
@@ -156,12 +89,12 @@ func (m *windowsMarker) ControlFunc() func(network, address string, c syscall.Ra
 // unset. reapply=true (uplink change) always writes, because writing 0 is the
 // documented way to clear a stale binding (the socket falls back to regular
 // routing, which is safe: with no uplink there is nothing to leak to, and
-// Ready() blocks enabling the gateway while offline).
+// EnableClientRoutes refuses to enable the gateway while offline).
 //
 // Returns the Control-level error (dead socket — eviction signal for the
 // registry) separately from setsockopt errors (live socket, wrong option —
 // caller logs or fails the dial).
-func (m *windowsMarker) apply(network, address string, c syscall.RawConn, reapply bool) (ctrlErr, sockErr error) {
+func (m *Manager) apply(network, address string, c syscall.RawConn, reapply bool) (ctrlErr, sockErr error) {
 	idx4 := m.index4.Load()
 	idx6 := m.index6.Load()
 	v4, v6, confident := unicastIFFamilies(network, address)
@@ -198,14 +131,14 @@ func (m *windowsMarker) apply(network, address string, c syscall.RawConn, reappl
 
 // kick schedules a debounced uplink re-detection. Non-blocking: called from
 // OS notification threads.
-func (m *windowsMarker) kick() {
+func (m *Manager) kick() {
 	select {
 	case m.kickCh <- struct{}{}:
 	default:
 	}
 }
 
-// watch is the marker's background goroutine: debounced re-detection on
+// watch is the Manager's background goroutine: debounced re-detection on
 // network change notifications plus the periodic registry sweep. cleanup
 // unregisters the OS callbacks when ctx dies.
 //
@@ -216,7 +149,7 @@ func (m *windowsMarker) kick() {
 // changes). Add a hostnet-style test — Start → socket via ControlFunc →
 // mutate default routes → assert getsockopt(IP_UNICAST_IF) — after the
 // monitor moves into the netstate manager
-func (m *windowsMarker) watch(ctx context.Context, cleanup func()) {
+func (m *Manager) watch(ctx context.Context, cleanup func()) {
 	defer cleanup()
 
 	coalesce := time.NewTimer(time.Hour)
@@ -272,8 +205,8 @@ func (m *windowsMarker) watch(ctx context.Context, cleanup func()) {
 
 // redetect recomputes both uplink indexes and, on change, re-binds every
 // registered socket.
-func (m *windowsMarker) redetect() {
-	idx4, idx6 := detectUplinkIndexes()
+func (m *Manager) redetect() {
+	idx4, idx6 := m.detectUplinkIndexes()
 	old4 := m.index4.Swap(idx4)
 	old6 := m.index6.Swap(idx6)
 	if old4 == idx4 && old6 == idx6 {
@@ -286,7 +219,7 @@ func (m *windowsMarker) redetect() {
 
 // reapply re-binds all registered sockets to the current indexes. Sockets
 // whose fd is dead (Control fails) are evicted.
-func (m *windowsMarker) reapply() {
+func (m *Manager) reapply() {
 	m.registry.forEachLive(func(e *registryEntry) error {
 		ctrlErr, sockErr := m.apply(e.network, e.address, e.conn, true)
 		if sockErr != nil {
@@ -301,7 +234,7 @@ func (m *windowsMarker) reapply() {
 // name heuristics). Index 0 means "no uplink for this family right now".
 // Works before the TUN exists: LUIDFromGUID fails for an absent adapter and
 // we simply exclude nothing.
-func detectUplinkIndexes() (idx4, idx6 uint32) {
+func (m *Manager) detectUplinkIndexes() (idx4, idx6 uint32) {
 	var exclude winipcfg.LUID
 	if luid, err := winipcfg.LUIDFromGUID(vpn.WintunGUID); err == nil {
 		exclude = luid
@@ -320,4 +253,41 @@ func detectUplinkIndexes() (idx4, idx6 uint32) {
 		idx6 = route6.IfIndex
 	}
 	return idx4, idx6
+}
+
+// unicastIFFamilies decides which address families' UNICAST_IF socket options
+// apply to a socket, from the network/address pair passed to a
+// net.Dialer.Control-style callback.
+//
+// Setting the wrong family's option fails the whole dial/listen (that was a
+// real bug: IPV6_UNICAST_IF on an AF_INET socket errors out), so the decision
+// must be conservative. The network string is authoritative when it carries
+// the family suffix — net.Dialer resolves the address first and invokes
+// Control with the concrete "tcp4"/"tcp6"/"udp4"/"udp6". For a bare
+// "tcp"/"udp" we fall back to parsing the literal address. If both are
+// inconclusive, confident=false tells the caller to attempt both families
+// best-effort (tolerating per-family errors) instead of failing.
+//
+// Note: v4=true with a "6" network means "IPv6 socket" — the caller must
+// still check IPV6_V6ONLY before touching the IPv4 half (dual-stack).
+func unicastIFFamilies(network, address string) (v4, v6, confident bool) {
+	switch {
+	case strings.HasSuffix(network, "4"):
+		return true, false, true
+	case strings.HasSuffix(network, "6"):
+		return false, true, true
+	}
+
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Is4() || addr.Is4In6() {
+			return true, false, true
+		}
+		return false, true, true
+	}
+
+	return true, true, false
 }

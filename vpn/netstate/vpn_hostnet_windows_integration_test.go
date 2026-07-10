@@ -2,10 +2,11 @@
 
 // Package netstate host-network integration tests, Windows edition.
 //
-// These tests exercise the real Windows plumbing (setupNAT/teardownNAT and
-// setupGatewayRoutes/teardownGatewayRoutes) against the *actual* host
-// network: they create WinNAT instances, WFP filters, flip per-interface
-// forwarding, spawn a real Wintun adapter and install /1 routes on it.
+// These tests exercise the real Windows plumbing behind Manager
+// (EnableServerNAT/DisableServerNAT and EnableClientRoutes/
+// DisableClientRoutes) against the *actual* host network: they create WinNAT
+// instances, WFP filters, flip per-interface forwarding, spawn a real Wintun
+// adapter and install /1 routes on it.
 //
 // They are DANGEROUS by nature — while a client-route test is mid-flight the
 // host's egress is captured by /1 routes pointing at a TUN nobody reads
@@ -41,6 +42,7 @@
 package netstate
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"testing"
@@ -84,6 +86,21 @@ func requireAdmin(t *testing.T) {
 	t.Helper()
 	if !windows.GetCurrentProcessToken().IsElevated() {
 		t.Fatal("hostnet tests require Administrator; the vpn_hostnet build tag means this run is deliberate, so failing loudly instead of skipping")
+	}
+}
+
+// startManager runs Manager.Start with a test-scoped context, so the client
+// tests pass the IPv4-uplink gate in EnableClientRoutes the same way
+// production does. The watch goroutine dies on the context cancel registered
+// here; verifyNoLeaks (registered before this, so running after) sees it gone.
+// Skips when the host is offline — the gate would legitimately refuse.
+func startManager(t *testing.T, mgr *Manager) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, mgr.Start(ctx))
+	if mgr.index4.Load() == 0 {
+		t.Skip("no IPv4 uplink on this host; EnableClientRoutes refuses while offline")
 	}
 }
 
@@ -153,14 +170,16 @@ func TestGatewayHostNetNATLifecycle(t *testing.T) {
 	forwardingBefore := forwardingEnabled(t, nicLUID)
 	require.False(t, awlNATInstalled(t), "pre-existing awl-gateway NetNat; clean the host before running")
 
-	state, err := setupNAT(testAwlSubnet, nicGUID)
-	require.NoError(t, err)
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, nicGUID))
+	require.True(t, mgr.ServerNATActive())
 
 	require.True(t, awlNATInstalled(t), "NetNat must exist while NAT is up")
 	require.True(t, forwardingEnabled(t, nicLUID), "forwarding must be on while NAT is up")
 	require.True(t, wfpRuleInstalled(t), "WFP block rule must be installed while NAT is up")
 
-	require.NoError(t, teardownNAT(state))
+	require.NoError(t, mgr.DisableServerNAT())
+	require.False(t, mgr.ServerNATActive())
 
 	require.False(t, awlNATInstalled(t), "teardown must remove the NetNat")
 	require.Equal(t, forwardingBefore, forwardingEnabled(t, nicLUID),
@@ -187,11 +206,11 @@ func TestGatewayHostNetNATPreservesExistingForwarding(t *testing.T) {
 		t.Cleanup(func() { setForwarding(t, nicLUID, false) })
 	}
 
-	state, err := setupNAT(testAwlSubnet, nicGUID)
-	require.NoError(t, err)
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, nicGUID))
 	require.True(t, forwardingEnabled(t, nicLUID))
 
-	require.NoError(t, teardownNAT(state))
+	require.NoError(t, mgr.DisableServerNAT())
 	require.True(t, forwardingEnabled(t, nicLUID),
 		"forwarding was already on before setup; teardown must NOT disable it")
 }
@@ -208,11 +227,12 @@ func TestGatewayHostNetNATStaleRecovery(t *testing.T) {
 	require.NoError(t, createWinNAT(testAwlSubnet))
 	require.True(t, awlNATInstalled(t))
 
-	state, err := setupNAT(testAwlSubnet, nicGUID)
-	require.NoError(t, err, "setupNAT must recover from a stale awl-gateway NetNat")
+	mgr := NewManager()
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, nicGUID),
+		"EnableServerNAT must recover from a stale awl-gateway NetNat")
 	require.True(t, awlNATInstalled(t))
 
-	require.NoError(t, teardownNAT(state))
+	require.NoError(t, mgr.DisableServerNAT())
 	require.False(t, awlNATInstalled(t))
 }
 
@@ -239,14 +259,16 @@ func TestGatewayHostNetNATRollback(t *testing.T) {
 		_, _ = runPowerShell(fmt.Sprintf("Remove-NetNat -Name %s -Confirm:$false", conflictName))
 	})
 
-	state, err := setupNAT(testAwlSubnet, nicGUID)
+	mgr := NewManager()
+	err = mgr.EnableServerNAT(testAwlSubnet, nicGUID)
 	if err == nil {
 		// If even overlapping-prefix instances are tolerated, there is no
 		// failure to roll back from. Clean up and skip rather than fail.
-		require.NoError(t, teardownNAT(state))
+		require.NoError(t, mgr.DisableServerNAT())
 		t.Skip("this host allows overlapping WinNAT instances; rollback path not reachable here")
 	}
 	require.Contains(t, err.Error(), "WinNAT", "failure must come from the WinNAT step")
+	require.False(t, mgr.ServerNATActive(), "a failed enable must leave the manager inactive")
 
 	require.False(t, awlNATInstalled(t), "no awl-gateway NetNat may remain after rollback")
 	require.Equal(t, forwardingBefore, forwardingEnabled(t, nicLUID),
@@ -313,10 +335,12 @@ func tunRoutes(t *testing.T, luid winipcfg.LUID) []string {
 func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 	verifyNoLeaks(t)
 	requireAdmin(t)
+	mgr := NewManager()
+	startManager(t, mgr)
 	tunLUID, tunGUID, _ := createTestTUN(t)
 
-	state, err := setupGatewayRoutes(tunGUID, 0)
-	require.NoError(t, err)
+	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
+	require.True(t, mgr.ClientRoutesActive())
 	// Egress of this host is now captured by the /1 routes into a TUN nobody
 	// reads — a black hole until teardown a few lines down.
 
@@ -328,7 +352,8 @@ func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 		require.Contains(t, routes, "8000::/1")
 	}
 
-	require.NoError(t, teardownGatewayRoutes(state))
+	require.NoError(t, mgr.DisableClientRoutes())
+	require.False(t, mgr.ClientRoutesActive())
 
 	for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"} {
 		require.NotContains(t, tunRoutes(t, tunLUID), prefix,
@@ -343,10 +368,11 @@ func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 func TestGatewayHostNetClientRoutesDieWithAdapter(t *testing.T) {
 	verifyNoLeaks(t)
 	requireAdmin(t)
+	mgr := NewManager()
+	startManager(t, mgr)
 	tunLUID, tunGUID, device := createTestTUN(t)
 
-	_, err := setupGatewayRoutes(tunGUID, 0)
-	require.NoError(t, err)
+	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
 	require.Contains(t, tunRoutes(t, tunLUID), "0.0.0.0/1")
 
 	// Simulate the crash: no teardown, just kill the adapter.

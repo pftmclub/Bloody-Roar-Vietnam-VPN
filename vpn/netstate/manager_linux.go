@@ -1,3 +1,5 @@
+//go:build linux && !android
+
 package netstate
 
 import (
@@ -7,13 +9,16 @@ import (
 	"syscall"
 )
 
-// Manager is the single entry point to this package: it owns the socket
-// marker (always-on, started once per process) and the runtime OS state of
-// VPN gateway mode — the client routes and the server NAT. The struct is the
-// same on every platform; the platform-specific behaviour lives in the marker
-// and in the setup/teardown functions the methods call. Consumers declare
-// their own narrow interfaces over the methods they use (see awl.NetManager,
-// service.NetManager, service.SocketMarker).
+// awlMark is the numeric value shared by the SO_MARK fwmark applied to marked
+// sockets and the policy-routing table ID holding their exemption routes.
+// 0x61776C = "awl" in ASCII (lowercase). The two live in different kernel
+// namespaces and don't collide; using one value makes awl-owned state
+// trivially greppable in `ip rule` / `ip route show table`.
+const awlMark = 0x61776C
+
+// Manager owns the Linux OS network state behind AWL's VPN gateway feature:
+// the always-on socket marking (SO_MARK, applied via ControlFunc) and the
+// runtime state of gateway mode — the client routes and the server NAT.
 //
 // Enable/Disable methods are idempotent and safe for concurrent use. The
 // internal mutex only guards the Manager's own state; the orchestration
@@ -21,43 +26,44 @@ import (
 // transactions — config, tunnel binding, DNS and the calls here — under its
 // own lock.
 type Manager struct {
-	marker marker
-
 	mu         sync.Mutex
 	routeState *routeState
 	natState   *natState
 }
 
-// NewManager returns the Manager for the current platform. On Android it
-// carries a no-op socket protector — use NewAndroidManager to wire
-// VpnService.protect.
+// NewManager returns the Manager for Linux. Setting SO_MARK requires
+// CAP_NET_ADMIN, which AWL already needs for TUN setup, so no extra
+// capability is required.
 func NewManager() *Manager {
-	return &Manager{marker: newMarker()}
+	return &Manager{}
 }
 
-// Start performs the marker's initial setup and launches any background
-// machinery it needs, living until ctx is cancelled. On Windows this is the
-// uplink detection + network-change watcher; elsewhere it is a no-op. Must be
-// called before the first libp2p socket is created (see marker.Start for the
-// offline-start semantics).
-func (m *Manager) Start(ctx context.Context) error {
-	return m.marker.Start(ctx)
-}
+// Start is a no-op on Linux: SO_MARK is interpreted by the kernel per packet,
+// there is no per-socket state to keep in sync with the network.
+func (m *Manager) Start(_ context.Context) error { return nil }
 
 // ControlFunc returns a function compatible with net.Dialer.Control and the
-// QUIC ListenUDP override, marking each new socket to bypass the VPN tunnel.
-// It returns nil when the platform is not configured (e.g. Android before the
-// host app supplies a protector).
+// QUIC ListenUDP override, marking each new socket with SO_MARK so its
+// traffic bypasses the VPN tunnel via the fwmark ip rule.
 func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn) error {
-	return m.marker.ControlFunc()
+	return func(_, _ string, c syscall.RawConn) error {
+		var sockErr error
+		err := c.Control(func(fd uintptr) {
+			sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, awlMark)
+		})
+		if err != nil {
+			return fmt.Errorf("sockmark control: %w", err)
+		}
+		if sockErr != nil {
+			return fmt.Errorf("sockmark SO_MARK: %w", sockErr)
+		}
+		return nil
+	}
 }
 
 // EnableClientRoutes installs the gateway client routes on the TUN (the
 // default-route capture plus the IPv6 fail-closed fence). Idempotent: a
-// second call while routes are installed is a no-op. On Windows it refuses
-// while no IPv4 uplink is known (marking could not exempt libp2p traffic —
-// routing loop); the condition is self-healing, so that is "try again once
-// online", not a permanent failure.
+// second call while routes are installed is a no-op.
 func (m *Manager) EnableClientRoutes(tunIfName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -65,16 +71,7 @@ func (m *Manager) EnableClientRoutes(tunIfName string) error {
 	if m.routeState != nil {
 		return nil
 	}
-	// Markers that can be temporarily unable to guarantee loop-free marking
-	// (Windows: no uplink detected right now) expose Ready. Other platforms
-	// don't implement the interface and skip the check.
-	if readier, ok := m.marker.(interface{ Ready() error }); ok {
-		if err := readier.Ready(); err != nil {
-			return fmt.Errorf("cannot enable VPN gateway: %w", err)
-		}
-	}
-
-	state, err := setupGatewayRoutes(tunIfName, m.marker.FWMark())
+	state, err := m.setupGatewayRoutes(tunIfName)
 	if err != nil {
 		return fmt.Errorf("setup gateway routes: %w", err)
 	}
@@ -95,7 +92,7 @@ func (m *Manager) DisableClientRoutes() error {
 	}
 	state := m.routeState
 	m.routeState = nil
-	return teardownGatewayRoutes(state)
+	return m.teardownGatewayRoutes(state)
 }
 
 // ClientRoutesActive reports whether gateway client routes are currently
@@ -107,9 +104,8 @@ func (m *Manager) ClientRoutesActive() bool {
 }
 
 // EnableServerNAT configures the exit-node data path for the awl subnet
-// (Linux: ip_forward + iptables chain + MASQUERADE; Windows: WFP filter +
-// per-interface forwarding + WinNAT). Idempotent: a second call while NAT is
-// configured is a no-op.
+// (ip_forward + iptables chain + MASQUERADE). Idempotent: a second call while
+// NAT is configured is a no-op.
 func (m *Manager) EnableServerNAT(awlSubnet, tunIfName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -117,7 +113,7 @@ func (m *Manager) EnableServerNAT(awlSubnet, tunIfName string) error {
 	if m.natState != nil {
 		return nil
 	}
-	state, err := setupNAT(awlSubnet, tunIfName)
+	state, err := m.setupNAT(awlSubnet, tunIfName)
 	if err != nil {
 		return fmt.Errorf("setup NAT: %w", err)
 	}
@@ -137,7 +133,7 @@ func (m *Manager) DisableServerNAT() error {
 	}
 	state := m.natState
 	m.natState = nil
-	return teardownNAT(state)
+	return m.teardownNAT(state)
 }
 
 // ServerNATActive reports whether the exit-node NAT is currently configured.

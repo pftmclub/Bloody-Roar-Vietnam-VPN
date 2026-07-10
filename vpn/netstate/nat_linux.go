@@ -36,7 +36,7 @@ type natState struct {
 // state (AWL-FORWARD chain, MASQUERADE rule, ip_forward=1) would otherwise
 // cause this function to fail at NewChain. We pre-clean any such leftovers
 // best-effort so the new setup gets a clean slate.
-func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
+func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	state := &natState{
 		awlSubnet: awlSubnet,
 		tunIfName: tunIfName,
@@ -80,7 +80,7 @@ func setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	// + ChainExists-gated clear/delete), so calling it on a half-built setup is
 	// safe.
 	if err := setupIptables(ipt, state); err != nil {
-		_ = teardownNAT(state)
+		_ = m.teardownNAT(state)
 		return nil, err
 	}
 
@@ -133,7 +133,7 @@ func setupIptables(ipt *iptables.IPTables, state *natState) error {
 
 // teardownNAT reverses the changes made by setupNAT. Safe to call on partially
 // set up state.
-func teardownNAT(state *natState) error {
+func (m *Manager) teardownNAT(state *natState) error {
 	if state == nil {
 		return nil
 	}
