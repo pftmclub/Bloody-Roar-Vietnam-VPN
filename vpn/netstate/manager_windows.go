@@ -4,7 +4,6 @@ package netstate
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -192,12 +191,12 @@ func (m *Manager) onNetworkChange() {
 
 // EnableClientRoutes installs the gateway client routes on the TUN (the
 // default-route capture plus the IPv6 fail-closed fence). Idempotent: a
-// second call while routes are installed is a no-op. It refuses while no
-// IPv4 uplink is known (marking could not exempt libp2p traffic — routing
-// loop); the condition is self-healing (the watcher re-binds sockets when
-// connectivity appears), so that is "try again once online", not a permanent
-// failure. IPv6 is not required: the tunnel is IPv4-only and gateway mode
-// fences IPv6.
+// second call while routes are installed is a no-op. Offline enable is
+// allowed with a warning: the /1 routes are bound to the TUN LUID and need
+// no uplink, marking with index 0 is a no-op, and the watcher re-binds
+// registered sockets once connectivity appears — the gateway self-heals
+// without a re-enable. IPv6 is not required: the tunnel is IPv4-only and
+// gateway mode fences IPv6.
 func (m *Manager) EnableClientRoutes(tunIfName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -205,10 +204,8 @@ func (m *Manager) EnableClientRoutes(tunIfName string) error {
 	if m.routeState != nil {
 		return nil
 	}
-	// TODO(gateway-offline-start): soften this gate to a warning so gateway
-	// client mode can be enabled/booted offline and self-heal when connectivity appears
 	if m.index4.Load() == 0 {
-		return errors.New("cannot enable VPN gateway: no active network connection (no IPv4 default route)")
+		logger.Warnf("gateway client enabled with no IPv4 uplink; internet will flow when network appears")
 	}
 
 	state, err := m.setupGatewayRoutes(tunIfName)

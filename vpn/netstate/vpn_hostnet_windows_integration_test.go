@@ -94,18 +94,20 @@ func requireAdmin(t *testing.T) {
 	}
 }
 
-// startManager runs Manager.Start with a test-scoped context, so the client
-// tests pass the IPv4-uplink gate in EnableClientRoutes the same way
-// production does. The watch goroutine dies on the context cancel registered
-// here; verifyNoLeaks (registered before this, so running after) sees it gone.
-// Skips when the host is offline — the gate would legitimately refuse.
+// startManager runs Manager.Start with a test-scoped context, populating the
+// uplink indexes the same way production does. The watch goroutine dies on
+// the context cancel registered here; verifyNoLeaks (registered before this,
+// so running after) sees it gone. Skips when the host is offline: enabling
+// offline is allowed (warn + self-heal), but the tests below assert against
+// a real uplink index (e.g. MarkerRebind), which an offline runner cannot
+// provide.
 func startManager(t *testing.T, mgr *Manager) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	require.NoError(t, mgr.Start(ctx))
 	if mgr.index4.Load() == 0 {
-		t.Skip("no IPv4 uplink on this host; EnableClientRoutes refuses while offline")
+		t.Skip("no IPv4 uplink on this host; these tests assert against a real uplink index")
 	}
 }
 

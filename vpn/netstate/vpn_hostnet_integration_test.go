@@ -338,6 +338,80 @@ func TestGatewayHostNetRoutesStalenessReconcileV6(t *testing.T) {
 	assertRoutesApplied(t)
 }
 
+// ---- R6: offline enable proceeds and self-heals when a default appears ----
+//
+// Enabling the gateway client with NO IPv4 default route must succeed (warn +
+// empty exemption table) with the TUN default and the v6 fence installed, and
+// the monitor must copy the host default into tableID once one appears — the
+// §8.4 offline-boot self-heal. We simulate "offline" by removing the host's
+// real IPv4 defaults and restoring them afterwards; while they are gone the
+// host's v4 egress is the TUN black hole, which is within this suite's risk
+// profile (every routes test black-holes egress mid-flight anyway).
+func TestGatewayHostNetRoutesOfflineEnableSelfHeals(t *testing.T) {
+	verifyNoLeaks(t)
+	requireRoot(t)
+	// A default is required not by the enable under test (that is the point)
+	// but as material: we snapshot the real defaults to remove and re-add.
+	requireDefaultRoute(t)
+	setupDummyTun(t)
+
+	origDefaults, err := getDefaultRoutes()
+	require.NoError(t, err)
+	require.NotEmpty(t, origDefaults)
+	for i := range origDefaults {
+		r := origDefaults[i]
+		require.NoError(t, netlink.RouteDel(&r), "remove host default %v", r)
+	}
+	t.Cleanup(func() {
+		// RouteReplace, not RouteAdd: the mid-test re-add below leaves one of
+		// them already present on the success path.
+		for i := range origDefaults {
+			r := origDefaults[i]
+			_ = netlink.RouteReplace(&r)
+		}
+	})
+
+	before := snapshotNet(t)
+
+	// See R4 for why Start + cancel are needed here.
+	mgr := NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, mgr.Start(ctx))
+	require.NoError(t, mgr.EnableClientRoutes(testTunIf),
+		"offline enable must proceed with a warning, not fail")
+	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
+	require.True(t, mgr.ClientRoutesActive())
+
+	// Offline shape: TUN default captured, exemption table empty (nothing to
+	// exempt yet). assertRoutesApplied is not usable here — it requires a
+	// non-empty exemption table.
+	main := cmdOut(t, "ip", "-4", "route", "show")
+	require.Contains(t, main, "dev "+testTunIf, "TUN default must be installed even offline")
+	require.Empty(t, strings.TrimSpace(routeTableDump(t, tableID)),
+		"the v4 exemption table must start empty when enabled offline")
+
+	// The network comes back: restore one real default in the main table.
+	restored := origDefaults[0]
+	require.NoError(t, netlink.RouteReplace(&restored))
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(routeTableDump(t, tableID), "default")
+	}, 5*time.Second, 100*time.Millisecond,
+		"the monitor must copy the appeared host default into the awl exemption table")
+
+	// The reconcile must have left the TUN default and the IPv6 fence alone.
+	assertRoutesApplied(t)
+
+	require.NoError(t, mgr.DisableClientRoutes())
+	require.False(t, mgr.ClientRoutesActive())
+
+	// Back out the mid-test re-add so the state is comparable with the
+	// "no defaults" snapshot; teardown must have removed everything else.
+	require.NoError(t, netlink.RouteDel(&restored))
+	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup routing state")
+}
+
 // ---------------------------------------------------------------------------
 // assertions
 // ---------------------------------------------------------------------------

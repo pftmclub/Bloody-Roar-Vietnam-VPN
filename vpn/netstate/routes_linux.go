@@ -102,12 +102,14 @@ func (m *Manager) setupGatewayRoutes(tunIfName string) (*routeState, error) {
 		return nil, fmt.Errorf("get default routes: %w", err)
 	}
 	if len(origDefaults) == 0 {
-		// TODO(gateway-offline-start): soften to a warning and proceed with an
-		// empty exemption table — the route monitor below already re-syncs it
-		// when a default appears (DHCP), so an offline boot with a persisted
-		// ClientEnabled would self-heal instead of failing Init. Needs a
-		// reconcile-from-empty verification + doc updates
-		return nil, fmt.Errorf("no IPv4 default route present, cannot configure VPN gateway")
+		// Offline enable is allowed: proceed with an empty exemption table. The
+		// route monitor (alive since Manager.Start) copies the default into
+		// tableID once one appears (DHCP), so an offline boot with a persisted
+		// ClientEnabled self-heals instead of failing Init. Until that reconcile
+		// (≤ one monitor tick) marked libp2p sockets fall through to the TUN
+		// default — a routing loop, but with no uplink there is no traffic to
+		// leak, only a connect delay.
+		logger.Warnf("gateway client enabled with no IPv4 uplink; internet will flow when network appears")
 	}
 
 	state := &routeState{

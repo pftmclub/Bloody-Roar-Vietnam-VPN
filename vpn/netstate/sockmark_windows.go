@@ -74,8 +74,10 @@ func (m *Manager) ControlFunc() func(network, address string, c syscall.RawConn)
 // index is unknown — the option simply stays
 // unset. rebind=true (uplink change) always writes, because writing 0 is the
 // documented way to clear a stale binding (the socket falls back to regular
-// routing, which is safe: with no uplink there is nothing to leak to, and
-// EnableClientRoutes refuses to enable the gateway while offline).
+// routing, which is safe: with no uplink there is no traffic at all, and once
+// one appears the watcher re-binds the registry within the debounce window —
+// the brief unmarked-libp2p loop into the TUN in between is the accepted
+// offline-enable transient).
 //
 // Returns the Control-level error (dead socket — eviction signal for the
 // registry) separately from setsockopt errors (live socket, wrong option —
