@@ -49,6 +49,8 @@ import (
 	"math/bits"
 	"net"
 	"net/netip"
+	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -157,6 +159,25 @@ func wfpRuleInstalled(t *testing.T) bool {
 		}
 	}
 	return false
+}
+
+// clientFenceRuleCount returns how many leak-fence rules are currently
+// visible in the filtering engine (8 while the client is enabled: 3 permits
+// + 1 block per family).
+func clientFenceRuleCount(t *testing.T) int {
+	t.Helper()
+	session, err := wf.New(&wf.Options{Name: "awl-hostnet-assert", Dynamic: true})
+	require.NoError(t, err)
+	defer session.Close()
+	rules, err := session.Rules()
+	require.NoError(t, err)
+	count := 0
+	for _, r := range rules {
+		if strings.HasPrefix(r.Name, wfpClientRulePrefix) {
+			count++
+		}
+	}
+	return count
 }
 
 func awlNATInstalled(t *testing.T) bool {
@@ -421,6 +442,11 @@ func tunRoutes(t *testing.T, luid winipcfg.LUID) []string {
 	return found
 }
 
+// The enable→disable sequence runs TWICE with the same manager: a runtime
+// re-enable after a disable is exactly the user flow that once looked broken
+// in manual testing (it wasn't — browser connection pools were lying), and
+// the double toggle pins that every enable produces the full state and every
+// disable removes all of it. Mirrored by the Linux R1 lifecycle test.
 func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 	verifyNoLeaks(t)
 	requireAdmin(t)
@@ -428,25 +454,31 @@ func TestGatewayHostNetClientRoutesLifecycle(t *testing.T) {
 	startManager(t, mgr)
 	tunLUID, tunGUID, _ := createTestTUN(t)
 
-	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
-	require.True(t, mgr.ClientRoutesActive())
-	// Egress of this host is now captured by the /1 routes into a TUN nobody
-	// reads — a black hole until teardown a few lines down.
+	for cycle := 1; cycle <= 2; cycle++ {
+		require.NoError(t, mgr.EnableClientRoutes(tunGUID), "cycle %d", cycle)
+		require.True(t, mgr.ClientRoutesActive(), "cycle %d", cycle)
+		// Egress of this host is now captured by the /1 routes into a TUN
+		// nobody reads — a black hole until teardown a few lines down.
 
-	routes := tunRoutes(t, tunLUID)
-	require.Contains(t, routes, "0.0.0.0/1")
-	require.Contains(t, routes, "128.0.0.0/1")
-	if tunHasIPv6(tunLUID) {
-		require.Contains(t, routes, "::/1", "IPv6 fence must be installed when the adapter has a v6 stack")
-		require.Contains(t, routes, "8000::/1")
-	}
+		routes := tunRoutes(t, tunLUID)
+		require.Contains(t, routes, "0.0.0.0/1", "cycle %d", cycle)
+		require.Contains(t, routes, "128.0.0.0/1", "cycle %d", cycle)
+		if tunHasIPv6(tunLUID) {
+			require.Contains(t, routes, "::/1", "cycle %d: IPv6 fence must be installed when the adapter has a v6 stack", cycle)
+			require.Contains(t, routes, "8000::/1", "cycle %d", cycle)
+		}
+		require.Equal(t, 8, clientFenceRuleCount(t),
+			"cycle %d: the leak fence (3 permits + block per family) must be up while enabled", cycle)
 
-	require.NoError(t, mgr.DisableClientRoutes())
-	require.False(t, mgr.ClientRoutesActive())
+		require.NoError(t, mgr.DisableClientRoutes(), "cycle %d", cycle)
+		require.False(t, mgr.ClientRoutesActive(), "cycle %d", cycle)
 
-	for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"} {
-		require.NotContains(t, tunRoutes(t, tunLUID), prefix,
-			"teardown must remove every gateway route")
+		for _, prefix := range []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"} {
+			require.NotContains(t, tunRoutes(t, tunLUID), prefix,
+				"cycle %d: teardown must remove every gateway route", cycle)
+		}
+		require.Equal(t, 0, clientFenceRuleCount(t),
+			"cycle %d: teardown must close the leak fence session", cycle)
 	}
 }
 
@@ -463,6 +495,12 @@ func TestGatewayHostNetClientRoutesDieWithAdapter(t *testing.T) {
 
 	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
 	require.Contains(t, tunRoutes(t, tunLUID), "0.0.0.0/1")
+	// This test deliberately skips teardown to simulate a crash, but the WFP
+	// fence session is process-scoped (dynamic), not test-scoped: without this
+	// its 8 rules would linger in the engine and inflate clientFenceRuleCount
+	// in later tests. Closing it here does not affect the crash assertion below
+	// (routes are bound to the adapter, not the WFP session).
+	t.Cleanup(func() { _ = mgr.DisableClientRoutes() })
 
 	// Simulate the crash: no teardown, just kill the adapter.
 	require.NoError(t, device.Close())
@@ -472,4 +510,110 @@ func TestGatewayHostNetClientRoutesDieWithAdapter(t *testing.T) {
 		return len(tunRoutes(t, tunLUID)) == 0
 	}, 15*time.Second, 200*time.Millisecond,
 		"all routes bound to the dead adapter must disappear")
+}
+
+// ---- Client: WFP leak fence ----
+
+// uplinkSourceIP returns an IPv4 address bound to the current uplink NIC — the
+// source address a socket would use for direct (non-tunnel) egress. Used to
+// force a connection to bypass the /1 routes via the strong host model.
+func uplinkSourceIP(t *testing.T) string {
+	t.Helper()
+	route, ok, err := bestUplinkDefault(windows.AF_INET, 0)
+	require.NoError(t, err)
+	if !ok {
+		t.Skip("no IPv4 uplink; the leak-fence bypass test needs a real NIC address")
+	}
+	uplinkLUID := winipcfg.LUID(route.IfLUID)
+
+	rows, err := winipcfg.GetUnicastIPAddressTable(windows.AF_INET)
+	require.NoError(t, err)
+	for i := range rows {
+		if rows[i].InterfaceLUID != uplinkLUID {
+			continue
+		}
+		addr := rows[i].Address.Addr()
+		if addr.IsLoopback() || addr.IsLinkLocalUnicast() {
+			continue
+		}
+		return addr.String()
+	}
+	t.Skip("no routable IPv4 address on the uplink NIC")
+	return ""
+}
+
+// curlBoundToNIC runs curl.exe forcing egress from the uplink NIC address
+// (--interface), i.e. explicitly bypassing the /1 tunnel capture via the
+// strong host model. Returns whether the request succeeded within the
+// timeout. curl.exe ships with Windows 10+/Server 2019+.
+func curlBoundToNIC(t *testing.T, srcIP string) bool {
+	t.Helper()
+	cmd := exec.Command("curl.exe", "--interface", srcIP, "-4", "-s", "-o", "NUL",
+		"--max-time", "8", "https://ifconfig.me")
+	err := cmd.Run()
+	return err == nil
+}
+
+// TestGatewayHostNetClientFenceBlocksBypass is the core effectiveness test for
+// the leak fence: a connection forced out of the physical NIC (bypassing the
+// /1 tunnel routes, the strong-host-model leak the fence exists to close) must
+// FAIL while the gateway client is on, and work again once it is off.
+//
+// The request is issued from a foreign process (curl.exe) on purpose: the
+// fence permits our OWN process by app ID (libp2p egress must keep bypassing
+// the tunnel), and the test binary is not awl.exe, so curl is correctly
+// subject to the BLOCK. This also proves the app-ID exemption does not leak to
+// unrelated processes.
+func TestGatewayHostNetClientFenceBlocksBypass(t *testing.T) {
+	verifyNoLeaks(t)
+	requireAdmin(t)
+	mgr := NewManager()
+	startManager(t, mgr)
+	_, tunGUID, _ := createTestTUN(t)
+	srcIP := uplinkSourceIP(t)
+
+	// Sanity: the NIC-bound request works before the fence is up. If the
+	// runner blocks outbound HTTPS entirely, this is not our test to run.
+	if !curlBoundToNIC(t, srcIP) {
+		t.Skip("NIC-bound HTTPS does not work even without the fence; runner egress is restricted")
+	}
+
+	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
+	require.Equal(t, 8, clientFenceRuleCount(t), "fence must be up while enabled")
+
+	require.False(t, curlBoundToNIC(t, srcIP),
+		"NIC-bound egress must be blocked by the fence while the gateway is on")
+
+	require.NoError(t, mgr.DisableClientRoutes())
+	require.Eventually(t, func() bool {
+		return curlBoundToNIC(t, srcIP)
+	}, 15*time.Second, 500*time.Millisecond,
+		"NIC-bound egress must work again after the fence is torn down")
+}
+
+// TestGatewayHostNetClientFenceAllowsClientServerCoexist verifies the client
+// fence and the server NAT keep independent WFP sessions: enabling both, then
+// tearing down each, removes only that role's rules.
+func TestGatewayHostNetClientFenceAllowsClientServerCoexist(t *testing.T) {
+	verifyNoLeaks(t)
+	requireAdmin(t)
+	mgr := NewManager()
+	startManager(t, mgr)
+	_, tunGUID, _ := createTestTUN(t)
+	_, nicGUID := pickServerTestNIC(t)
+
+	require.NoError(t, mgr.EnableClientRoutes(tunGUID))
+	require.NoError(t, mgr.EnableServerNAT(testAwlSubnet, nicGUID))
+	t.Cleanup(func() { _ = mgr.DisableServerNAT() })
+
+	require.Equal(t, 8, clientFenceRuleCount(t), "client fence rules present with both roles on")
+	require.True(t, wfpRuleInstalled(t), "server BLOCK rule present with both roles on")
+
+	// Tearing down the client leaves the server filter intact.
+	require.NoError(t, mgr.DisableClientRoutes())
+	require.Equal(t, 0, clientFenceRuleCount(t), "client fence gone after client disable")
+	require.True(t, wfpRuleInstalled(t), "server filter must survive a client-only teardown")
+
+	require.NoError(t, mgr.DisableServerNAT())
+	require.False(t, wfpRuleInstalled(t), "server filter gone after server disable")
 }

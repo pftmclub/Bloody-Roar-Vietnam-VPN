@@ -136,6 +136,10 @@ func TestGatewayHostNetNATPreservesExistingIPForward(t *testing.T) {
 
 // ---- R1: route apply/teardown lifecycle ----
 
+// The enable→disable sequence runs TWICE with the same manager: a runtime
+// re-enable after a disable is a real user flow (and the mirror of the Windows
+// ClientRoutesLifecycle test), so pin that each enable applies the full state
+// and each disable restores the exact pre-setup snapshot.
 func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 	verifyNoLeaks(t)
 	requireRoot(t)
@@ -145,14 +149,17 @@ func TestGatewayHostNetRoutesLifecycle(t *testing.T) {
 	before := snapshotNet(t)
 
 	mgr := NewManager()
-	require.NoError(t, mgr.EnableClientRoutes(testTunIf))
-	require.True(t, mgr.ClientRoutesActive())
+	for cycle := 1; cycle <= 2; cycle++ {
+		require.NoError(t, mgr.EnableClientRoutes(testTunIf), "cycle %d", cycle)
+		require.True(t, mgr.ClientRoutesActive(), "cycle %d", cycle)
 
-	assertRoutesApplied(t)
+		assertRoutesApplied(t)
 
-	require.NoError(t, mgr.DisableClientRoutes())
-	require.False(t, mgr.ClientRoutesActive())
-	require.Equal(t, before, snapshotNet(t), "teardown must restore the exact pre-setup routing state")
+		require.NoError(t, mgr.DisableClientRoutes(), "cycle %d", cycle)
+		require.False(t, mgr.ClientRoutesActive(), "cycle %d", cycle)
+		require.Equal(t, before, snapshotNet(t),
+			"cycle %d: teardown must restore the exact pre-setup routing state", cycle)
+	}
 }
 
 // ---- R2: route stale-recovery after the TUN's own default self-destructed ----

@@ -20,11 +20,22 @@ import (
 )
 
 const (
-	wfpSublayerName = "awl-gateway"
-	wfpRuleName     = "awl-gateway: block forwarded LAN/CGNAT egress from TUN"
+	wfpSublayerName = "awl-gateway-server"
+	wfpRuleName     = "awl-gateway-server: block forwarded LAN/CGNAT egress from TUN"
 
 	// winNATName is the name of the WinNAT instance owned by awl.
 	winNATName = "awl-gateway"
+
+	// wfpSublayerWeight is the weight of both awl WFP sublayers (the server
+	// forward-layer filter and the client leak fence). 0x8000 is the midpoint
+	// of the uint16 range: sublayers arbitrate high-to-low, and our BLOCK
+	// rules lose only to a hard permit (FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT)
+	// from a higher-weight sublayer. The midpoint deliberately does NOT claim
+	// the top: these filters fence awl's own traffic, they are not a host
+	// kill-switch, so a security product that outranks us on purpose (EDR,
+	// corporate firewall) is allowed to win. Contrast wireguard-windows,
+	// whose firewall takes 0xFFFF exactly because it IS a kill-switch.
+	wfpSublayerWeight = 0x8000
 )
 
 // natState holds the state needed to teardown NAT on Windows.
@@ -266,40 +277,19 @@ func resyncForwarding(state *natState, route uplinkRoute, ok bool, enable func(w
 // when the session closes or the process dies, so there is no stale-WFP
 // recovery path.
 func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error {
-	session, err := wf.New(&wf.Options{
-		Name:        "Anywherelan VPN gateway",
-		Description: "Blocks forwarded traffic from awl devices to the exit node's private networks",
-		Dynamic:     true,
-	})
+	session, sublayerID, err := openDynamicWFPSession(
+		"Anywherelan VPN gateway",
+		"Blocks forwarded traffic from awl devices to the exit node's private networks",
+		wfpSublayerName,
+	)
 	if err != nil {
-		return fmt.Errorf("open WFP session: %w", err)
+		return err
 	}
 	// Parked in state immediately, so on any later failure the caller's
 	// rollback (teardownNAT) closes the session — the same idiom as the
 	// forwarding and WinNAT steps. A dangling dynamic session would otherwise
 	// outlive its guarantees until process exit.
 	state.wfpSession = session
-
-	sublayerID, err := newWFPGUID()
-	if err != nil {
-		return err
-	}
-	// Weight 0x8000 = the midpoint of the uint16 sublayer range. Sublayers
-	// arbitrate high-to-low, and our BLOCK loses only to a hard permit
-	// (CLEAR_ACTION_RIGHT) from a higher-weight sublayer — see the rule
-	// comment below. The midpoint deliberately does NOT claim the top:
-	// this filter fences awl's forwarded transit, it is not a host
-	// kill-switch, so a security product that outranks us on purpose (EDR,
-	// corporate firewall) is allowed to win. Contrast wireguard-windows,
-	// whose firewall takes 0xFFFF exactly because it IS a kill-switch.
-	err = session.AddSublayer(&wf.Sublayer{
-		ID:     wf.SublayerID(sublayerID),
-		Name:   wfpSublayerName,
-		Weight: 0x8000,
-	})
-	if err != nil {
-		return fmt.Errorf("add WFP sublayer: %w", err)
-	}
 
 	ruleID, err := newWFPGUID()
 	if err != nil {
@@ -321,7 +311,7 @@ func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error 
 		ID:         wf.RuleID(ruleID),
 		Name:       wfpRuleName,
 		Layer:      wf.LayerIPForwardV4,
-		Sublayer:   wf.SublayerID(sublayerID),
+		Sublayer:   sublayerID,
 		Weight:     1000,
 		Conditions: conditions,
 		Action:     wf.ActionBlock,
@@ -331,6 +321,40 @@ func setupWFP(state *natState, tunIfIndex uint32, awlPrefix netip.Prefix) error 
 	}
 
 	return nil
+}
+
+// openDynamicWFPSession opens a dynamic WFP session and creates one sublayer
+// in it at wfpSublayerWeight, returning both. Shared by the server
+// forward-layer filter (setupWFP) and the client leak fence
+// (setupClientFence). Dynamic: the kernel removes the sublayer and every rule
+// under it when the session closes or the process dies, so there is no
+// stale-WFP recovery path on either side. On failure the session is closed
+// here; on success the caller must park it where its teardown can close it.
+func openDynamicWFPSession(name, description, sublayerName string) (*wf.Session, wf.SublayerID, error) {
+	session, err := wf.New(&wf.Options{
+		Name:        name,
+		Description: description,
+		Dynamic:     true,
+	})
+	if err != nil {
+		return nil, wf.SublayerID{}, fmt.Errorf("open WFP session: %w", err)
+	}
+
+	sublayerGUID, err := newWFPGUID()
+	if err != nil {
+		_ = session.Close()
+		return nil, wf.SublayerID{}, err
+	}
+	sublayerID := wf.SublayerID(sublayerGUID)
+	if err := session.AddSublayer(&wf.Sublayer{
+		ID:     sublayerID,
+		Name:   sublayerName,
+		Weight: wfpSublayerWeight,
+	}); err != nil {
+		_ = session.Close()
+		return nil, wf.SublayerID{}, fmt.Errorf("add WFP sublayer: %w", err)
+	}
+	return session, sublayerID, nil
 }
 
 func newWFPGUID() (windows.GUID, error) {
