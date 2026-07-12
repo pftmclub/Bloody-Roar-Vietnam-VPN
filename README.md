@@ -250,10 +250,10 @@ In short: reach for SOCKS5 to send a single app through a peer, and for the VPN 
 | --- | --- | --- | --- |
 | Linux | ✅ | ✅ | fully supported |
 | Android | ✅ | ❌ | exit-node role needs root — not planned |
-| Windows | ⏳ | ⏳ | coming next |
+| Windows | ✅ | ✅ | fully supported |
 | macOS | ❌ | ❌ | needs volunteers for testing |
 
-On macOS and Windows awl currently refuses to start with VPN gateway enabled.
+On macOS awl currently refuses to start with VPN gateway enabled.
 
 > ⚠️ **IPv6 is not tunnelled.** The gateway only carries IPv4. While it's on, all IPv6 traffic is dropped so that your real IPv6 address is never exposed past the exit node:
 > - **Dual-stack (IPv4 + IPv6):** everything automatically uses IPv4 through the tunnel.
@@ -261,7 +261,7 @@ On macOS and Windows awl currently refuses to start with VPN gateway enabled.
 
 ### Serve as an exit node
 
-This lets your other devices route their internet traffic out through this one. It is **off by default** — see [Why serving as an exit node is opt-in](#why-serving-as-an-exit-node-is-opt-in) below. Two things need to be set: turn the gateway service on, then allow each specific device to use it. Serving as an exit node is Linux-only (see the status table above).
+This lets your other devices route their internet traffic out through this one. It is **off by default** — see [Why serving as an exit node is opt-in](#why-serving-as-an-exit-node-is-opt-in) below. Two things need to be set: turn the gateway service on, then allow each specific device to use it.
 
 **Desktop (web UI):** open http://admin.awl, go to **Settings** (the gear icon, top-right) and turn on **Serve as VPN Gateway**. Then, for each device you want to permit, open its card on the Overview page, click **Settings**, and set **Allow as exit node** to *Allowed*. On `awl-tray` you can also toggle the service from the tray menu under **VPN Gateway → Serve as VPN Gateway**.
 
@@ -305,7 +305,7 @@ awl cli gateway client stop
 
 ### Why serving as an exit node is opt-in
 
-Unlike the SOCKS5 proxy, serving as a VPN gateway changes global system state on the host: awl turns on `net.ipv4.ip_forward` and installs iptables rules. That can interfere with the host's existing networking or firewall setup, and it isn't something awl can sandbox — so we don't enable it on a routine install. You opt in explicitly, the same way every mainstream VPN (ZeroTier, WireGuard, OpenVPN, ...) keeps exit-node mode opt-in.
+Unlike the SOCKS5 proxy, serving as a VPN gateway changes global system state on the host: on Linux awl turns on `net.ipv4.ip_forward` and installs iptables rules; on Windows it creates a WinNAT instance, enables per-interface IP forwarding and installs a WFP firewall filter. That can interfere with the host's existing networking or firewall setup, and it isn't something awl can sandbox — so we don't enable it on a routine install. You opt in explicitly, the same way every mainstream VPN (ZeroTier, WireGuard, OpenVPN, ...) keeps exit-node mode opt-in.
 
 The privacy exposure — your IP appearing as the source of another device's traffic — is *not* what this toggle gates: it is the same for SOCKS5 and the VPN gateway, and it's controlled by the per-device **Use as exit** permission (see [Security and privacy notes](#security-and-privacy-notes) below). This toggle only governs the host-level networking changes above.
 
@@ -314,12 +314,16 @@ The privacy exposure — your IP appearing as the source of another device's tra
 - **A device isn't available as an exit node.** It hasn't turned on **Serve as VPN Gateway**, or hasn't set **Allow as exit node** to *Allowed* for you, or the status exchange hasn't propagated yet — wait up to ~5 minutes or until the next reconnect.
 - **A "what's my IP" site still shows your own IP after enabling.** Check the gateway status (the **VPN Gateway** card, or `awl cli gateway status`): if it's not connected, awl can't reach the exit node, so nothing is being tunnelled.
 - **A site works over IPv6 but not through the gateway.** Expected — IPv6 isn't tunnelled (see the note above). Dual-stack hosts fall back to IPv4 automatically; anything IPv6-only won't work while the gateway is on.
+- **Turning on *Serve as VPN Gateway* fails on Windows.** Windows effectively allows one NAT instance per host, and it may already be taken by Docker (Windows containers), WSL2 or Internet Connection Sharing — the error message lists the current holders. Free it up, or share this device over SOCKS5 instead: the SOCKS5 exit node doesn't need NAT.
+- **No IPv6 connectivity after awl crashed (Linux).** If awl is killed (not shut down) with the gateway client on, its IPv6 block stays behind. It is removed automatically on the next awl start (and stop).
+- **Devices are reachable only via relay from a Windows machine with multiple network interfaces.** awl on Windows pins its peer-to-peer traffic to the interface that holds the default route, so peers reachable only through a secondary network card may fall back to relayed connections.
 
 ### Security and privacy notes
 
 - **Your IP is exposed.** Once you serve as an exit node, the public IPs that those devices reach see your IP, not theirs.
-- **Your LAN is not.** awl drops forwarded traffic to RFC 1918 / RFC 6598 / RFC 3927 ranges (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`) so a gateway client cannot reach the exit node's home network.
+- **Your LAN is not.** awl drops forwarded traffic to RFC 1918 / RFC 6598 / RFC 3927 ranges (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`) so a gateway client cannot reach the exit node's home network. On Linux this is an iptables chain; on Windows, a WFP forward-layer BLOCK filter with the same subnet list.
 - **DNS:** in client gateway mode awl forces upstream DNS to a public resolver (`1.1.1.1` by default) so the LAN resolver can't leak queries past the tunnel. If you'd rather use a different resolver, you can change it by hand in the config file (`dns.upstreamDNSAddress`) while awl is stopped.
+- **Connections open before you enable the gateway are cut, not leaked.** When you turn client gateway mode on, existing outbound connections (a browser's keep-alive pools are the common case) are forced to break so applications re-establish them through the tunnel — otherwise, on Windows, they would keep flowing directly through your physical network card and expose your real IP. On Linux this happens naturally (the tunnel routing kills them); on Windows awl installs a WFP firewall to force it. One deliberate exception on Windows: if this device is *hosting* a service (e.g. an RDP or SMB server) and someone is already connected to it, that inbound connection keeps answering directly, so that enabling the gateway over a remote session does not disconnect you. Fresh inbound connections while the gateway is on are still limited to the tunnel path.
 
 ## Configuration
 

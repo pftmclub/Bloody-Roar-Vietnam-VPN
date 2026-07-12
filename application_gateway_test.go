@@ -709,11 +709,12 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode.PeerID()))
 	checkClientBound(true)
 
-	// Idempotent: a second enable with the same peer must not double-apply.
-	// The route-state pointer must be reused.
-	routeStateBefore := client.app.VPNGateway.ClientRouteState()
+	// Idempotent: a second enable with the same peer must not double-apply —
+	// the OS-level install count must not grow.
+	netManager := client.app.NetManager.(*testNetManager)
+	enablesBefore := netManager.ClientEnables()
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode.PeerID()))
-	ts.Same(routeStateBefore, client.app.VPNGateway.ClientRouteState(), "route state must be reused on re-enable with same peer")
+	ts.Equal(enablesBefore, netManager.ClientEnables(), "routes must be reused on re-enable with same peer")
 	client.app.Conf.RLock()
 	ts.Equal(exitNode.PeerID(), client.app.Conf.VPNGateway.GatewayPeerID, "config still points to original peer")
 	client.app.Conf.RUnlock()
@@ -730,8 +731,8 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 
 	// Atomic switch to a second exit node: spin up a third peer, register
 	// it as a valid exit node for the client, then call EnableGateway with
-	// the new peer ID *while gateway is already on*. The route state
-	// pointer must survive (no teardown) and the tunnel/config bindings
+	// the new peer ID *while gateway is already on*. The installed routes
+	// must survive (no teardown/reinstall) and the tunnel/config bindings
 	// must rebind to the new peer.
 	exitNode2 := ts.NewTestPeer(true)
 	exitNode2.app.Tunnel.SetVPNGatewayServerEnabled(true)
@@ -741,9 +742,9 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 
 	grantExitNodePermission(ts, exitNode2, client)
 
-	routeStatePreSwitch := client.app.VPNGateway.ClientRouteState()
+	enablesPreSwitch := netManager.ClientEnables()
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode2.PeerID()))
-	ts.Same(routeStatePreSwitch, client.app.VPNGateway.ClientRouteState(), "atomic switch must not reinstall routes")
+	ts.Equal(enablesPreSwitch, netManager.ClientEnables(), "atomic switch must not reinstall routes")
 	client.app.Conf.RLock()
 	ts.Equal(exitNode2.PeerID(), client.app.Conf.VPNGateway.GatewayPeerID, "config must point to new exit node")
 	client.app.Conf.RUnlock()

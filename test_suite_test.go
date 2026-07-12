@@ -41,17 +41,6 @@ import (
 
 const TestTUNBatchSize = 100
 
-// noopSockMarker is a sockmark.Marker test double that does nothing. Production
-// wiring sets SocketControlFunc unconditionally; tests run as a non-root user
-// where SO_MARK fails with EPERM, which would break libp2p dials and leave
-// QUIC reuse goroutines hanging past the goleak window.
-type noopSockMarker struct{}
-
-func (noopSockMarker) FWMark() uint32 { return 0 }
-func (noopSockMarker) ControlFunc() func(network, address string, c syscall.RawConn) error {
-	return nil
-}
-
 type TestSuite struct {
 	*require.Assertions
 
@@ -135,10 +124,8 @@ func (ts *TestSuite) NewTestPeerWithConfig(configModifier ConfigModifier) TestPe
 	return ts.newTestPeerWithConfig(true, listenAddrs, nil, configModifier, nil)
 }
 
-// AppModifier is a test hook for tweaking the Application before Init runs.
-// Use NewTestPeerWithAppConfig when a test needs to inject a custom SockMarker
-// (e.g. a no-op marker so a Gateway.Enabled=true config does not cause libp2p
-// dials to fail on SO_MARK EPERM in a non-root test environment).
+// AppModifier is a test hook for tweaking the Application before Init runs
+// (e.g. replacing the NetManager double or libp2p options).
 type AppModifier func(*Application)
 
 func (ts *TestSuite) NewTestPeerWithAppConfig(configModifier ConfigModifier, appModifier AppModifier) TestPeer {
@@ -201,10 +188,8 @@ func (ts *TestSuite) buildTestPeer(disableLogging bool, listenAddrs []multiaddr.
 
 	app := New()
 	app.AllowEmptyBootstrapPeers = ts.isSimnet
-	app.DisableGatewayOSSetup = true
-	// SocketControlFunc is now wired unconditionally in production; tests
-	// run as a non-root user where SO_MARK fails with EPERM, which breaks libp2p dials.
-	app.SockMarker = noopSockMarker{}
+	// Bookkeeping-only NetManager: no OS state is touched (see testNetManager).
+	app.NetManager = &testNetManager{}
 	app.ExtraLibp2pOpts = extraLibp2pOpts
 
 	app.SetupLoggerAndConfig(config.AppTypeAwl)
@@ -616,4 +601,79 @@ func parsePacketIPs(rawPacket []byte) (src, dst net.IP) {
 		return nil, nil
 	}
 	return append([]byte{}, pkt.Src...), append([]byte{}, pkt.Dst...)
+}
+
+// testNetManager is a NetManager test double: it tracks the enabled/disabled
+// state and counts OS-level installs, but never touches the OS. Two reasons
+// tests can't use the real netstate.Manager: production wiring sets
+// SocketControlFunc unconditionally, and tests run as a non-root user where
+// SO_MARK fails with EPERM, which would break libp2p dials and leave QUIC
+// reuse goroutines hanging past the goleak window; the routes/NAT setup
+// likewise needs root and a real TUN. The enable counters let tests assert
+// idempotence (re-enable must not reinstall OS state).
+type testNetManager struct {
+	mu                sync.Mutex
+	clientActive      bool
+	serverActive      bool
+	clientEnableCount int
+	serverEnableCount int
+}
+
+func (m *testNetManager) Start(_ context.Context) error { return nil }
+func (m *testNetManager) ControlFunc() func(network, address string, c syscall.RawConn) error {
+	return nil
+}
+
+func (m *testNetManager) EnableClientRoutes(_ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.clientActive {
+		m.clientActive = true
+		m.clientEnableCount++
+	}
+	return nil
+}
+
+func (m *testNetManager) DisableClientRoutes() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clientActive = false
+	return nil
+}
+
+func (m *testNetManager) ClientRoutesActive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clientActive
+}
+
+func (m *testNetManager) EnableServerNAT(_, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.serverActive {
+		m.serverActive = true
+		m.serverEnableCount++
+	}
+	return nil
+}
+
+func (m *testNetManager) DisableServerNAT() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.serverActive = false
+	return nil
+}
+
+func (m *testNetManager) ServerNATActive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.serverActive
+}
+
+// ClientEnables returns how many times client routes were actually installed
+// (idempotent re-enables don't count).
+func (m *testNetManager) ClientEnables() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clientEnableCount
 }

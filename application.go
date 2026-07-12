@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/anywherelan/ts-dns/control/controlknobs"
@@ -39,7 +40,7 @@ import (
 	"github.com/anywherelan/awl/ringbuffer"
 	"github.com/anywherelan/awl/service"
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/sockmark"
+	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 const (
@@ -76,11 +77,6 @@ type Application struct {
 	// For tests only:
 	ExtraLibp2pOpts          []libp2p.Option
 	AllowEmptyBootstrapPeers bool
-	// DisableGatewayOSSetup skips the netlink/iptables/route work in
-	// service.Gateway, leaving only the in-process bookkeeping. Tests run
-	// without root and against a mock TUN that has no kernel netlink
-	// presence, so the real setup paths cannot run. Set before Init.
-	DisableGatewayOSSetup bool
 
 	ctx        context.Context
 	ctxCancel  context.CancelFunc
@@ -93,13 +89,28 @@ type Application struct {
 	VPNGateway *service.VPNGateway
 	Dns        *DNSService
 
-	// SockMarker abstracts the per-platform socket-marking strategy used to
-	// keep libp2p traffic out of the VPN tunnel when gateway mode is on.
-	// Callers (notably cmd/gomobile-lib on Android) may set this before
-	// Init to inject a platform-specific marker — e.g.
-	//   app.SockMarker = sockmark.NewAndroid(protectorFn)
-	// Init falls back to sockmark.New() if SockMarker is left nil.
-	SockMarker sockmark.Marker
+	// NetManager owns the OS-level network state behind VPN gateway mode:
+	// socket marking plus the runtime client routes / server NAT. Callers may
+	// set it before Init to inject a non-default implementation —
+	// cmd/gomobile-lib wires the Android protector via
+	// netstate.NewAndroidManager, tests inject a bookkeeping-only fake (they
+	// run without root against a mock TUN, so the real OS setup cannot run).
+	// Init falls back to netstate.NewManager() if left nil.
+	NetManager NetManager
+}
+
+// NetManager is the surface of *netstate.Manager consumed by Application and
+// its services (service.NetManager and service.SocketMarker are subsets of
+// it). Declared consumer-side so tests can substitute a fake.
+type NetManager interface {
+	Start(ctx context.Context) error
+	ControlFunc() func(network, address string, c syscall.RawConn) error
+	EnableClientRoutes(tunIfName string) error
+	DisableClientRoutes() error
+	ClientRoutesActive() bool
+	EnableServerNAT(awlSubnet, tunIfName string) error
+	DisableServerNAT() error
+	ServerNATActive() bool
 }
 
 func New() *Application {
@@ -110,8 +121,14 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 	a.logger.Info("Application initialization started")
 
 	a.ctx, a.ctxCancel = context.WithCancel(ctx)
-	if a.SockMarker == nil {
-		a.SockMarker = sockmark.New()
+	if a.NetManager == nil {
+		a.NetManager = netstate.NewManager()
+	}
+	// Start before InitHost so the very first libp2p sockets are already
+	// marked (on Windows: bound to the detected uplink). An offline start is
+	// not an error — see netstate.Manager.Start; only hard failures abort Init.
+	if err := a.NetManager.Start(a.ctx); err != nil {
+		return fmt.Errorf("start socket marker: %v", err)
 	}
 	a.P2p = p2p.NewP2p(a.ctx)
 	p2pHost, err := a.P2p.InitHost(a.makeP2pHostConfig())
@@ -143,7 +160,7 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 
 	a.Dns = NewDNSService(a.Conf, a.Eventbus, a.ctx, a.logger)
 	a.AuthStatus = service.NewAuthStatus(a.P2p, a.Conf, a.Eventbus)
-	a.SOCKS5, err = service.NewSOCKS5(a.P2p, a.Conf, a.SockMarker)
+	a.SOCKS5, err = service.NewSOCKS5(a.P2p, a.Conf, a.NetManager)
 	if err != nil {
 		return fmt.Errorf("failed to init socks5: %v", err)
 	}
@@ -162,7 +179,7 @@ func (a *Application) Init(ctx context.Context, tunDevice tun.Device) error {
 		}, a.Eventbus, new(awlevent.KnownPeerChanged))
 	}
 
-	a.VPNGateway = service.NewVPNGateway(a.Conf, a.Tunnel, a.vpnDevice, a.P2p, a.SockMarker, a.Dns, a.DisableGatewayOSSetup)
+	a.VPNGateway = service.NewVPNGateway(a.Conf, a.Tunnel, a.vpnDevice, a.P2p, a.NetManager, a.Dns)
 
 	handler := api.NewHandler(a.Conf, a.P2p, a.AuthStatus, a.Tunnel, a.SOCKS5, a.LogBuffer, a.Dns, a.VPNGateway)
 	a.Api = handler
@@ -325,7 +342,7 @@ func (a *Application) makeP2pHostConfig() p2p.HostConfig {
 		// SocketControlFunc is always used: marking happens at dial
 		// time on every socket, so libp2p connections opened *before* gateway
 		// mode is toggled on at runtime are already exempt from the VPN route.
-		SocketControlFunc: a.SockMarker.ControlFunc(),
+		SocketControlFunc: a.NetManager.ControlFunc(),
 		Libp2pOpts: append([]libp2p.Option{
 			libp2p.EnableRelay(),
 			libp2p.EnableAutoNATv2(),
