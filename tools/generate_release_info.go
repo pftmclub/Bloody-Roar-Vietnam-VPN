@@ -3,10 +3,14 @@
 package main
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"flag"
 	"html/template"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -17,6 +21,7 @@ var releaseDescriptionTemplate string
 func main() {
 	var buildPath string
 	flag.StringVar(&buildPath, "build_path", "build", "directory with build files")
+	flag.Parse()
 
 	files, err := os.ReadDir(buildPath)
 	if err != nil {
@@ -30,6 +35,7 @@ func main() {
 	var awlTrayWindows []string
 	var awlTrayWindows7 []string
 	var awlTrayMacos []string
+	var checksums []checksum
 
 	for _, file := range files {
 		if file.IsDir() {
@@ -54,7 +60,16 @@ func main() {
 			awlTrayWindows = append(awlTrayWindows, filename)
 		case strings.HasPrefix(filename, "awl-tray-macos"):
 			awlTrayMacos = append(awlTrayMacos, filename)
+		default:
+			// not a release asset, skip it from downloads and checksums
+			continue
 		}
+
+		hash, err := sha256File(filepath.Join(buildPath, filename))
+		if err != nil {
+			panic(err)
+		}
+		checksums = append(checksums, checksum{Name: filename, Hash: hash})
 	}
 
 	sort.Strings(awlLinux)
@@ -64,6 +79,9 @@ func main() {
 	sort.Strings(awlTrayWindows)
 	sort.Strings(awlTrayWindows7)
 	sort.Strings(awlTrayMacos)
+	sort.Slice(checksums, func(i, j int) bool {
+		return checksums[i].Name < checksums[j].Name
+	})
 
 	releaseTag := strings.TrimPrefix(awlAndroid, "awl-android-")
 	releaseTag = strings.TrimSuffix(releaseTag, ".apk")
@@ -73,7 +91,7 @@ func main() {
 		panic(err)
 	}
 
-	data := map[string]interface{}{
+	data := map[string]any{
 		"ReleaseTag":      releaseTag,
 		"AwlAndroid":      awlAndroid,
 		"AwlLinux":        awlLinux,
@@ -83,10 +101,31 @@ func main() {
 		"AwlTrayWindows":  awlTrayWindows,
 		"AwlTrayWindows7": awlTrayWindows7,
 		"AwlTrayMacos":    awlTrayMacos,
+		"Checksums":       checksums,
 	}
 
 	err = temp.Execute(os.Stdout, data)
 	if err != nil {
 		panic(err)
 	}
+}
+
+type checksum struct {
+	Name string
+	Hash string
+}
+
+func sha256File(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

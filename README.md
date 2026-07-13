@@ -1,6 +1,7 @@
 <p align="center">
     <a href="https://github.com/anywherelan/awl/blob/master/LICENSE"><img alt="GitHub license" src="https://img.shields.io/github/license/anywherelan/awl?color=brightgreen"></a>
     <a href="https://github.com/anywherelan/awl/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/anywherelan/awl" /></a>
+    <a href="https://f-droid.org/packages/com.anywherelan.awl/"><img alt="F-Droid" src="https://img.shields.io/f-droid/v/com.anywherelan.awl" /></a>
     <a href="https://github.com/anywherelan/awl/actions/workflows/test.yml"><img alt="Test build status" src="https://github.com/anywherelan/awl/actions/workflows/test.yml/badge.svg" /></a>
 </p>
 
@@ -13,6 +14,7 @@
   - [Screenshots](#camera-screenshots)
   - [How it works](#how-it-works)
   - [Security](#security)
+  - [Reproducible builds](#reproducible-builds)
 - [Installation](#installation)
   - [The web UI](#the-web-ui)
   - [Android](#android)
@@ -113,6 +115,13 @@ awl's transport security comes from [libp2p](https://docs.libp2p.io/).
 - **Key compromise:** there is no revocation mechanism. If an identity key leaks, generate a new one and re-add peers.
 - **Metadata:** nodes participating in the DHT can observe which peer IDs are online and being looked up. Packet contents are end-to-end encrypted and not visible to them.
 
+## Reproducible builds
+
+awl's release binaries are built reproducibly on every platform. Builds run in public GitHub Actions from tagged source (see the [build workflow](.github/workflows/build-manual.yml) and [`build.sh`](build.sh)), using `-trimpath` and `-buildid=` with pinned dependencies, so the same source produces byte-identical output.
+
+- **Android:** the app is independently reproducible-verified: F-Droid rebuilds the application from source and verifies that the resulting APK matches the APK published in the GitHub Releases. See its [reproducibility status](https://verification.f-droid.org/packages/com.anywherelan.awl/).
+- **Desktop:** every GitHub release includes SHA-256 checksums for its archives. You can independently reproduce a release yourself by building the same tag according to [`BUILDING.md`](BUILDING.md) and verifying that the checksums match.
+
 # Installation
 
 awl ships in two desktop flavors:
@@ -130,7 +139,10 @@ Once awl is running, open **http://admin.awl** in a browser. `admin.awl` is a ma
 
 ## Android
 
-Install the APK from the [releases page](https://github.com/anywherelan/awl/releases) and open the app.
+<a href="https://f-droid.org/packages/com.anywherelan.awl/"><img src="https://fdroid.gitlab.io/artwork/badge/get-it-on.png" alt="Get it on F-Droid" height="80"></a>
+<a href="https://github.com/anywherelan/awl/releases"><img src="docs/images/badge_github.png" alt="Get it on GitHub" height="80"></a>
+
+Get it from [F-Droid](https://f-droid.org/packages/com.anywherelan.awl/), or download the APK directly from the [GitHub releases page](https://github.com/anywherelan/awl/releases), both are the same app.
 
 ## Windows (`awl-tray`)
 
@@ -464,7 +476,7 @@ On desktop (`awl-tray`) you can upgrade application by clicking system tray icon
 
 ### Android
 
-Awl is not yet published in any store, so the only option is to download new version .apk from the [releases page](https://github.com/anywherelan/awl/releases) and install it manually.
+Update via [F-Droid](https://f-droid.org/packages/com.anywherelan.awl/), or download the latest .apk from the [releases page](https://github.com/anywherelan/awl/releases) and install it manually.
 
 ### Server
 
