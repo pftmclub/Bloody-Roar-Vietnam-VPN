@@ -15,18 +15,26 @@ func gatewayStatus(api *apiclient.Client, w io.Writer) error {
 	}
 	gw := info.VPNGateway
 
-	fmt.Fprintf(w, "VPN gateway client enabled: %v\n", gw.ClientEnabled)
-	fmt.Fprintf(w, "VPN gateway server enabled: %v\n", gw.ServerEnabled)
+	line := func(label, value string) {
+		fmt.Fprintf(w, "%-14s %s\n", label+":", value)
+	}
+
+	line("Server", formatEnabled(gw.ServerEnabled))
+	line("Client", formatEnabled(gw.ClientEnabled))
 	if gw.ClientEnabled {
-		fmt.Fprintf(w, "Gateway peer:               %s (%s)\n", gw.GatewayPeerName, gw.GatewayPeerID)
-		fmt.Fprintf(w, "Gateway peer connected:     %v\n", gw.Connected)
+		name := gw.GatewayPeerName
+		if name == "" {
+			name = gw.GatewayPeerID
+		}
+		line("Gateway peer", fmt.Sprintf("%s [%s]", name, formatConnected(gw.Connected)))
+		line("Peer ID", gw.GatewayPeerID)
 		if gw.GatewayPublicIP != "" {
-			fmt.Fprintf(w, "Gateway public IP:          %s\n", gw.GatewayPublicIP)
+			line("Public IP", gw.GatewayPublicIP)
 		}
 		if gw.GatewayPing > 0 {
-			fmt.Fprintf(w, "Gateway ping:               %s\n", gw.GatewayPing.Round(time.Millisecond))
+			line("Ping", gw.GatewayPing.Round(time.Millisecond).String())
 		}
-		fmt.Fprintf(w, "Gateway via relay:          %v\n", gw.GatewayThroughRelay)
+		line("Connection", formatRelay(gw.GatewayThroughRelay))
 	}
 
 	return nil
