@@ -3,10 +3,12 @@ package vpn
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"net"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -44,6 +46,131 @@ func BenchmarkPacket_PoolCopyToClear(b *testing.B) {
 		copyPacket.clear()
 		packetsPool.Put(copyPacket)
 	}
+}
+
+// a peer-controlled IPv4 packet must never be able to crash the process
+// through Parse/RecalculateChecksum slicing past the packet bounds.
+func TestPacket_Parse_RejectsMalformedIPv4(t *testing.T) {
+	newRawIPv4 := func(size int, ihlWords byte, protocol byte) []byte {
+		raw := make([]byte, size)
+		raw[0] = 0x40 | (ihlWords & 0x0f) // version 4 + IHL
+		if len(raw) > 9 {
+			raw[9] = protocol
+		}
+		return raw
+	}
+
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"ihl larger than packet", newRawIPv4(20, 15, 0)}, // ipHeaderLen is 60 > 20
+		{"ihl below minimum", newRawIPv4(20, 4, 0)},       // ipHeaderLen is 16 < 20
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := new(Packet)
+			_, _ = p.ReadFrom(bytes.NewReader(tc.raw))
+			require.False(t, p.Parse(), "malformed packet must be rejected by Parse")
+		})
+	}
+}
+
+// defense in depth: RecalculateChecksum must be panic-safe on malformed or
+// truncated packets, including when called without a prior successful Parse.
+func TestPacket_RecalculateChecksum_MalformedNoPanic(t *testing.T) {
+	build := func(size int, ihlWords, protocol byte) *Packet {
+		raw := make([]byte, size)
+		raw[0] = 0x40 | (ihlWords & 0x0f)
+		if len(raw) > 9 {
+			raw[9] = protocol
+		}
+		p := new(Packet)
+		_, _ = p.ReadFrom(bytes.NewReader(raw))
+		// Src/Dst are populated by Parse; the guards must hold even when they are
+		// nil (RecalculateChecksum called directly).
+		return p
+	}
+
+	cases := []struct {
+		name            string
+		size            int
+		ihlWords, proto byte
+	}{
+		{"ihl past packet, tcp", 20, 15, IPProtocolTCP},
+		{"ihl past packet, udp", 20, 15, IPProtocolUDP},
+		{"valid ihl, tcp header truncated", 20, 5, IPProtocolTCP},
+		{"valid ihl, udp header truncated", 24, 5, IPProtocolUDP},
+		{"valid ihl, non-transport proto", 20, 5, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := build(tc.size, tc.ihlWords, tc.proto)
+			require.NotPanics(t, func() { p.RecalculateChecksum() })
+		})
+	}
+}
+
+// C2: an oversized tunnel packet must return an error rather than spinning
+// forever on zero-length reads into the full buffer. Reproduces the production
+// path (io.LimitedReader wrapping the peer stream).
+func TestPacket_ReadFrom_RejectsOversized(t *testing.T) {
+	body := bytes.Repeat([]byte{0xab}, MaxPacketBodySize*2)
+	lr := &io.LimitedReader{R: bytes.NewReader(body), N: int64(len(body))}
+	p := new(Packet)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.ReadFrom(lr)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "exceeds max")
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadFrom looped forever on oversized packet")
+	}
+}
+
+// C2 boundary: the largest body that still leaves the buffer with room (i.e.
+// does not fill it) must be read successfully.
+func TestPacket_ReadFrom_AcceptsMaxSize(t *testing.T) {
+	size := MaxPacketBodySize - 1
+	body := bytes.Repeat([]byte{0xab}, size)
+	lr := &io.LimitedReader{R: bytes.NewReader(body), N: int64(len(body))}
+	p := new(Packet)
+
+	n, err := p.ReadFrom(lr)
+	require.NoError(t, err)
+	require.Equal(t, int64(size), n)
+	require.Len(t, p.Packet, size)
+}
+
+// H11: CopyTo must re-point Src/Dst onto the copy's own buffer, otherwise they
+// dangle into the original's buffer and read garbage once it is reused.
+func TestPacket_CopyTo_SrcDstAliasCopyBuffer(t *testing.T) {
+	a := require.New(t)
+	orig, _ := testUDPPacket()
+	a.NotNil(orig.Src)
+	a.NotNil(orig.Dst)
+
+	wantSrc := append(net.IP(nil), orig.Src...)
+	wantDst := append(net.IP(nil), orig.Dst...)
+
+	cp := new(Packet)
+	orig.CopyTo(cp)
+
+	// Simulate the original returning to the pool and its buffer being reused.
+	for i := range orig.Buffer {
+		orig.Buffer[i] = 0xff
+	}
+
+	a.Equal(wantSrc, cp.Src, "copy Src must survive original buffer reuse")
+	a.Equal(wantDst, cp.Dst, "copy Dst must survive original buffer reuse")
+	// Recalculating on the copy must still yield the correct checksum.
+	a.NotPanics(func() { cp.RecalculateChecksum() })
 }
 
 func testUDPPacket() (*Packet, []byte) {

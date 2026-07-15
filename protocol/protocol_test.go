@@ -95,11 +95,20 @@ func TestReadPacketHeader_RejectsBothFlags(t *testing.T) {
 
 func TestReadPacketHeader_RejectsHugeSize(t *testing.T) {
 	var header [8]byte
-	binary.BigEndian.PutUint64(header[:], tunnelMaxLength+1)
+	binary.BigEndian.PutUint64(header[:], uint64(vpn.MaxPacketBodySize)+1)
 
 	_, _, err := ReadPacketHeader(bytes.NewReader(header[:]))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeds max")
+}
+
+func TestReadPacketHeader_AcceptsMaxBodySize(t *testing.T) {
+	var header [8]byte
+	binary.BigEndian.PutUint64(header[:], uint64(vpn.MaxPacketBodySize))
+
+	size, _, err := ReadPacketHeader(bytes.NewReader(header[:]))
+	require.NoError(t, err)
+	require.Equal(t, uint64(vpn.MaxPacketBodySize), size)
 }
 
 func TestReadPacketHeader_TruncatedStream(t *testing.T) {
