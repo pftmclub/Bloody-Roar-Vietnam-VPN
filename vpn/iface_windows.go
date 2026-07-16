@@ -44,6 +44,14 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 	if err != nil {
 		return nil, fmt.Errorf("do as system: %v", err)
 	}
+	// Close the freshly created adapter if any later setup step fails, otherwise
+	// the Wintun adapter leaks.
+	success := false
+	defer func() {
+		if !success {
+			_ = tunDevice.Close()
+		}
+	}()
 
 	nativeTunDevice := tunDevice.(*tun.NativeTun)
 	luid := winipcfg.LUID(nativeTunDevice.LUID())
@@ -54,7 +62,6 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 	// force NLMTU ourselves via winipcfg, otherwise local apps see MTU=65535,
 	// send oversized packets, and the size check in ReadTUNPackets silently drops them.
 	if err := setInterfaceMTU(logger, luid, winipcfg.AddressFamily(windows.AF_INET), uint32(mtu)); err != nil {
-		tunDevice.Close()
 		return nil, fmt.Errorf("set IPv4 MTU on tun: %v", err)
 	}
 	// TODO: support ipv6. Forwarding still ignores IPv6 packets (see Device.WritePacket),
@@ -74,6 +81,7 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 		return nil, fmt.Errorf("unable to setup interface IP: %v", err)
 	}
 
+	success = true
 	return tunDevice, nil
 }
 

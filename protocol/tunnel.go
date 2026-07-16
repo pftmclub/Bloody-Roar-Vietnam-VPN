@@ -25,11 +25,6 @@ const (
 	tunnelFlagGatewayForward uint64 = 1 << 63
 	tunnelFlagGatewayReturn  uint64 = 1 << 62
 	tunnelLengthMask         uint64 = ^(tunnelFlagGatewayForward | tunnelFlagGatewayReturn)
-	// tunnelMaxLength bounds the per-packet size we'll accept on read. The
-	// real cap is vpn.maxContentSize (MTU + overhead); this is a generous
-	// upper bound to reject obvious garbage early without crossing package
-	// dependencies.
-	tunnelMaxLength uint64 = 1 << 20
 )
 
 // ReadPacketHeader reads an 8-byte tunnel packet header from the stream and
@@ -53,8 +48,8 @@ func ReadPacketHeader(stream io.Reader) (size uint64, dir vpn.GatewayDir, err er
 		dir = vpn.GatewayDirReturn
 	}
 	size = v & tunnelLengthMask
-	if size > tunnelMaxLength {
-		return 0, 0, fmt.Errorf("invalid tunnel header: size %d exceeds max %d", size, tunnelMaxLength)
+	if size > uint64(vpn.MaxPacketBodySize) {
+		return 0, 0, fmt.Errorf("invalid tunnel header: size %d exceeds max %d", size, vpn.MaxPacketBodySize)
 	}
 	return size, dir, nil
 }
