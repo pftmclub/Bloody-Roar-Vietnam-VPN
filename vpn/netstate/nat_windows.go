@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wf"
@@ -96,6 +97,11 @@ func (m *Manager) setupNAT(awlSubnet, tunIfName string) (*natState, error) {
 	// NetNat behind (WFP leftovers are impossible — dynamic session). Remove
 	// it so New-NetNat below gets a clean slate.
 	cleaned, err := cleanupStaleWinNAT()
+	if winNATUnavailable(err) {
+		// Not a cleanup problem: WinNAT does not exist on this host at all,
+		// and the "pre-clean" framing would only obscure that.
+		return nil, err
+	}
 	if err != nil {
 		return nil, fmt.Errorf("pre-clean stale WinNAT: %w", err)
 	}
@@ -417,11 +423,41 @@ const powerShellTimeout = time.Minute
 func runPowerShell(command string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), powerShellTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command).CombinedOutput()
+	// The OutputEncoding prefix forces UTF-8 on the redirected pipes: without
+	// it PowerShell encodes its (localized) error text in the console
+	// codepage, which mangles non-ASCII into '?' by the time it reaches logs.
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+		"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "+command)
+	// awl runs as a GUI process with no console of its own, so a bare
+	// powershell.exe would get a fresh visible console window.
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("powershell %q: %w (output: %s)", command, err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
+}
+
+// winNATUnavailable reports whether err is WMI's WBEM_E_INVALID_CLASS from a
+// *-NetNat cmdlet: the MSFT_NetNat class does not exist on this installation
+// at all. Windows Home editions do not ship WinNAT, and on other editions the
+// class can be missing when neither Hyper-V nor RAS components are enabled or
+// the WMI repository is corrupted. Matched by HRESULT, not message text — the
+// text is localized.
+func winNATUnavailable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "0x80041010")
+}
+
+// winNATUnavailableError replaces the raw multi-line PowerShell dump with an
+// actionable message for the winNATUnavailable case. The original error is
+// deliberately not wrapped: the HRESULT is the whole story, and this text is
+// shown verbatim in the UI.
+func winNATUnavailableError() error {
+	return errors.New("WinNAT is not available on this Windows installation " +
+		"(WMI class MSFT_NetNat does not exist, HRESULT 0x80041010). " +
+		"It is missing on Windows Home editions; on other editions it requires Hyper-V or RAS " +
+		"components. VPN gateway server mode cannot work without it — " +
+		"see the Troubleshooting section in the README; the SOCKS5 exit node works without WinNAT")
 }
 
 // netNATEntry is one WinNAT instance as reported by
@@ -466,6 +502,9 @@ func findNetNAT(entries []netNATEntry, name string) (netNATEntry, bool) {
 // listNetNAT returns the current WinNAT instances.
 func listNetNAT() ([]netNATEntry, error) {
 	out, err := runPowerShell("Get-NetNat | Select-Object Name,InternalIPInterfaceAddressPrefix | ConvertTo-Json -Compress")
+	if winNATUnavailable(err) {
+		return nil, winNATUnavailableError()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -499,6 +538,9 @@ func createWinNAT(awlSubnet string) error {
 	_, err := runPowerShell(cmd)
 	if err == nil {
 		return nil
+	}
+	if winNATUnavailable(err) {
+		return winNATUnavailableError()
 	}
 
 	existing := "unavailable"

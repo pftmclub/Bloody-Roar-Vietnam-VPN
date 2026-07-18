@@ -111,6 +111,22 @@ func TestResyncForwarding(t *testing.T) {
 	}
 }
 
+// winNATUnavailable must recognize WBEM_E_INVALID_CLASS by HRESULT alone:
+// the surrounding message is localized (the sample below is from a Russian
+// Windows 11 Home), so text matching is not an option.
+func TestWinNATUnavailable(t *testing.T) {
+	realError := errors.New(`powershell "Get-NetNat | Select-Object Name,InternalIPInterfaceAddressPrefix | ConvertTo-Json -Compress": exit status 1 (output: Get-NetNat : Недопустимый класс
+At line:1 char:1
++ Get-NetNat | Select-Object Name,InternalIPInterfaceAddressPrefix | Co ...
++ ~~~~~~~~~~
+    + CategoryInfo          : MetadataError: (MSFT_NetNat:root/StandardCimv2/MSFT_NetNat) [Get-NetNat], CimException
+    + FullyQualifiedErrorId : HRESULT 0x80041010,Get-NetNat)`)
+	require.True(t, winNATUnavailable(realError))
+
+	require.False(t, winNATUnavailable(nil))
+	require.False(t, winNATUnavailable(errors.New(`powershell "New-NetNat": exit status 1 (output: some other failure)`)))
+}
+
 // PowerShell's ConvertTo-Json emits three shapes depending on result count:
 // nothing at all, a bare object, or an array. parseNetNATJSON must handle all.
 func TestParseNetNATJSON(t *testing.T) {
