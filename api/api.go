@@ -15,6 +15,8 @@ import (
 	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	glog "github.com/labstack/gommon/log"
+	"go.uber.org/zap"
 
 	"github.com/anywherelan/awl/config"
 	"github.com/anywherelan/awl/p2p"
@@ -95,8 +97,20 @@ func (h *Handler) setupRouter(address string) (*echo.Echo, error) {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+	// Route echo's internal logs (panic stacks from Recover, response-write
+	// failures) into the awl logger. StdLogger is the net/http Server.ErrorLog
+	// ("http: accept error", "http: panic serving"): echo.New built it from
+	// the default logger's stdout, and configureServer copies it into the
+	// server at startup, so it must be replaced here, not on e.Server.
+	e.Logger = newEchoLogger(&h.logger.SugaredLogger)
+	stdLogger, err := zap.NewStdLogAt(h.logger.Desugar(), zap.ErrorLevel)
+	if err != nil {
+		return nil, err
+	}
+	e.StdLogger = stdLogger
+
 	val := validator.New()
-	err := val.RegisterValidation("trimmed_str_not_empty", validateTrimmedStringNotEmpty, false)
+	err = val.RegisterValidation("trimmed_str_not_empty", validateTrimmedStringNotEmpty, false)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +122,9 @@ func (h *Handler) setupRouter(address string) (*echo.Echo, error) {
 	// (basic auth 401s, panics recovered to 500s).
 	e.Use(errorLogMiddleware(h.logger))
 	if !h.conf.DevMode() {
-		e.Use(middleware.Recover())
+		e.Use(middleware.RecoverWithConfig(middleware.RecoverConfig{
+			LogLevel: glog.ERROR,
+		}))
 	}
 
 	if h.conf.HttpBasicAuth.Password != "" {
