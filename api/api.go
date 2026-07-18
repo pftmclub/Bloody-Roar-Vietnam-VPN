@@ -104,6 +104,9 @@ func (h *Handler) setupRouter(address string) (*echo.Echo, error) {
 	e.Validator = &customValidator{validator: val}
 
 	// Middleware
+	// First/outermost, so it also sees errors from the middleware below
+	// (basic auth 401s, panics recovered to 500s).
+	e.Use(errorLogMiddleware(h.logger))
 	if !h.conf.DevMode() {
 		e.Use(middleware.Recover())
 	}
