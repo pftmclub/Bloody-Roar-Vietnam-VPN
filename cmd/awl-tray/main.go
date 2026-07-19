@@ -169,6 +169,28 @@ func subscribeToNotifications(app *awl.Application) {
 			logger.Errorf("show notification: incoming friend request: %v", notifyErr)
 		}
 	}, app.Eventbus, new(awlevent.ReceivedAuthRequest))
+
+	// VPN gateway reachability: notify the user when the connection to their
+	// selected VPN gateway peer goes up or down.
+	awlevent.WrapSubscriptionToCallback(app.Ctx(), func(evt interface{}) {
+		change := evt.(awlevent.VPNGatewayConnectivityChanged)
+		peerName := change.PeerID
+		if kp, ok := app.Conf.GetPeer(change.PeerID); ok {
+			peerName = kp.DisplayName()
+		}
+		var title, body string
+		if change.Connected {
+			title = "Anywherelan: VPN gateway connected"
+			body = fmt.Sprintf("Connected to: %s", peerName)
+		} else {
+			title = "Anywherelan: VPN gateway disconnected"
+			body = fmt.Sprintf("Lost connection to: %s", peerName)
+		}
+		notifyErr := beeep.Notify(title, body, embeds.GetIconPath())
+		if notifyErr != nil {
+			logger.Errorf("show notification: vpn gateway connectivity: %v", notifyErr)
+		}
+	}, app.Eventbus, new(awlevent.VPNGatewayConnectivityChanged))
 }
 
 func openWebGUI(a *awl.Application) error {

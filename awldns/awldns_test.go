@@ -68,6 +68,77 @@ func TestDNS(t *testing.T) {
 	}
 }
 
+func TestDNSAAAAQueryDoesNotReturnARecord(t *testing.T) {
+	a := require.New(t)
+	port := FindFreePort()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	resolver := NewResolver(addr)
+	defer resolver.Close()
+	// TODO: remove sleep. We need it because NewResolver starts servers in goroutines
+	time.Sleep(50 * time.Millisecond)
+
+	resolver.ReceiveConfiguration("", map[string]string{
+		"admin": "127.0.0.66",
+	})
+
+	req := new(dns.Msg)
+	req.SetQuestion("admin.awl.", dns.TypeAAAA)
+	resp, _, err := new(dns.Client).Exchange(req, addr)
+	a.NoError(err)
+	a.Equal(dns.RcodeSuccess, resp.Rcode)
+	a.Empty(resp.Answer)
+}
+
+func TestDNSAQueryReturnsARecord(t *testing.T) {
+	a := require.New(t)
+	port := FindFreePort()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	resolver := NewResolver(addr)
+	defer resolver.Close()
+	// TODO: remove sleep. We need it because NewResolver starts servers in goroutines
+	time.Sleep(50 * time.Millisecond)
+
+	resolver.ReceiveConfiguration("", map[string]string{
+		"admin": "127.0.0.66",
+	})
+
+	req := new(dns.Msg)
+	req.SetQuestion("admin.awl.", dns.TypeA)
+	resp, _, err := new(dns.Client).Exchange(req, addr)
+	a.NoError(err)
+	a.Equal(dns.RcodeSuccess, resp.Rcode)
+	a.Len(resp.Answer, 1)
+
+	aRecord, ok := resp.Answer[0].(*dns.A)
+	a.True(ok)
+	a.Equal("admin.awl.", aRecord.Hdr.Name)
+	a.Equal("127.0.0.66", aRecord.A.String())
+}
+
+func TestDNSUnknownAddressReturnsNameError(t *testing.T) {
+	a := require.New(t)
+	port := FindFreePort()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	resolver := NewResolver(addr)
+	defer resolver.Close()
+	// TODO: remove sleep. We need it because NewResolver starts servers in goroutines
+	time.Sleep(50 * time.Millisecond)
+
+	resolver.ReceiveConfiguration("", map[string]string{
+		"admin": "127.0.0.66",
+	})
+
+	req := new(dns.Msg)
+	req.SetQuestion("unknown.awl.", dns.TypeA)
+	resp, _, err := new(dns.Client).Exchange(req, addr)
+	a.NoError(err)
+	a.Equal(dns.RcodeNameError, resp.Rcode)
+	a.Empty(resp.Answer)
+}
+
 func NewResolverClient(address string) *net.Resolver {
 	dialer := &net.Dialer{Timeout: time.Second}
 	return &net.Resolver{

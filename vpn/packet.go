@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 
@@ -61,12 +62,17 @@ func (data *Packet) clear() {
 
 func (data *Packet) CopyTo(copyPacket *Packet) {
 	*copyPacket = *data
-	// set Packet reference to a new buffer
+	// Buffer is an array copied by value above, but Packet/Src/Dst are slice
+	// headers still aliasing data.Buffer. Re-derive them as sub-slices of the
+	// copy's own buffer.
 	copyPacket.Packet = copyPacket.Buffer[tunPacketOffset : len(data.Packet)+tunPacketOffset]
+	if data.Src != nil {
+		copyPacket.setAddrs()
+	}
 }
 
 func (data *Packet) ReadFrom(stream io.Reader) (int64, error) {
-	var totalRead = tunPacketOffset
+	totalRead := tunPacketOffset
 	for {
 		n, err := stream.Read(data.Buffer[totalRead:])
 		totalRead += n
@@ -75,6 +81,13 @@ func (data *Packet) ReadFrom(stream io.Reader) (int64, error) {
 			return int64(totalRead - tunPacketOffset), nil
 		} else if err != nil {
 			return int64(totalRead - tunPacketOffset), err
+		}
+		// The buffer is sized with slack above the MTU (maxContentSize), so a
+		// valid single-packet body never fills it. A full buffer means an
+		// oversized frame; reject it instead of reading into the empty tail
+		// (which would spin on (0, nil) reads).
+		if totalRead == len(data.Buffer) {
+			return int64(totalRead - tunPacketOffset), fmt.Errorf("packet body exceeds max size %d bytes", MaxPacketBodySize)
 		}
 	}
 }
@@ -90,19 +103,25 @@ func (data *Packet) Parse() bool {
 		if len(packet) < ipv4.HeaderLen {
 			return false
 		}
+		// Validate the header length against the actual packet so downstream
+		// slicing (RecalculateChecksum) can't run past the packet and panic.
+		// Transport-length is not enforced here (it would drop legit non-first IP
+		// fragments); RecalculateChecksum guards its own transport slicing.
+		ipHeaderLen := int(packet[0]&0x0f) << 2
+		if ipHeaderLen < ipv4.HeaderLen || ipHeaderLen > len(packet) {
+			return false
+		}
+		data.IPProtocol = packet[9]
 
-		data.Src = packet[device.IPv4offsetSrc : device.IPv4offsetSrc+net.IPv4len]
-		data.Dst = packet[device.IPv4offsetDst : device.IPv4offsetDst+net.IPv4len]
 		data.IsIPv6 = false
-		data.IPProtocol = data.Packet[9]
+		data.setAddrs()
 	case ipv6.Version:
 		if len(packet) < ipv6.HeaderLen {
 			return false
 		}
 
-		data.Src = packet[device.IPv6offsetSrc : device.IPv6offsetSrc+net.IPv6len]
-		data.Dst = packet[device.IPv6offsetDst : device.IPv6offsetDst+net.IPv6len]
 		data.IsIPv6 = true
+		data.setAddrs()
 		// TODO: set data.IPProtocol
 	default:
 		return false
@@ -114,24 +133,45 @@ func (data *Packet) Parse() bool {
 func (data *Packet) RecalculateChecksum() {
 	if data.IsIPv6 {
 		// TODO
-	} else {
-		ipHeaderLen := int(data.Packet[0]&0x0f) << 2
-		copy(data.Packet[ipv4offsetChecksum:], []byte{0, 0})
-		ipChecksum := checksumIPv4Header(data.Packet[:ipHeaderLen])
-		binary.BigEndian.PutUint16(data.Packet[ipv4offsetChecksum:], ipChecksum)
+		return
+	}
+	// Guard against malformed lengths so a bad packet can't slice past bounds and
+	// panic, even if RecalculateChecksum is called without a prior valid Parse.
+	ipHeaderLen := int(data.Packet[0]&0x0f) << 2
+	if ipHeaderLen < ipv4.HeaderLen || ipHeaderLen > len(data.Packet) {
+		return
+	}
+	copy(data.Packet[ipv4offsetChecksum:], []byte{0, 0})
+	ipChecksum := checksumIPv4Header(data.Packet[:ipHeaderLen])
+	binary.BigEndian.PutUint16(data.Packet[ipv4offsetChecksum:], ipChecksum)
 
-		switch protocol := data.Packet[9]; protocol {
-		case IPProtocolTCP:
-			tcpOffsetChecksum := ipHeaderLen + 16
-			copy(data.Packet[tcpOffsetChecksum:], []byte{0, 0})
-			checksum := checksumIPv4TCPUDP(data.Packet[ipHeaderLen:], uint32(protocol), data.Src, data.Dst)
-			binary.BigEndian.PutUint16(data.Packet[tcpOffsetChecksum:], checksum)
-		case IPProtocolUDP:
-			udpOffsetChecksum := ipHeaderLen + 6
-			copy(data.Packet[udpOffsetChecksum:], []byte{0, 0})
-			checksum := checksumIPv4TCPUDP(data.Packet[ipHeaderLen:], uint32(protocol), data.Src, data.Dst)
-			binary.BigEndian.PutUint16(data.Packet[udpOffsetChecksum:], checksum)
+	switch protocol := data.Packet[9]; protocol {
+	case IPProtocolTCP:
+		if len(data.Packet) < ipHeaderLen+18 {
+			return
 		}
+		tcpOffsetChecksum := ipHeaderLen + 16
+		copy(data.Packet[tcpOffsetChecksum:], []byte{0, 0})
+		checksum := checksumIPv4TCPUDP(data.Packet[ipHeaderLen:], uint32(protocol), data.Src, data.Dst)
+		binary.BigEndian.PutUint16(data.Packet[tcpOffsetChecksum:], checksum)
+	case IPProtocolUDP:
+		if len(data.Packet) < ipHeaderLen+8 {
+			return
+		}
+		udpOffsetChecksum := ipHeaderLen + 6
+		copy(data.Packet[udpOffsetChecksum:], []byte{0, 0})
+		checksum := checksumIPv4TCPUDP(data.Packet[ipHeaderLen:], uint32(protocol), data.Src, data.Dst)
+		binary.BigEndian.PutUint16(data.Packet[udpOffsetChecksum:], checksum)
+	}
+}
+
+func (data *Packet) setAddrs() {
+	if data.IsIPv6 {
+		data.Src = data.Packet[device.IPv6offsetSrc : device.IPv6offsetSrc+net.IPv6len]
+		data.Dst = data.Packet[device.IPv6offsetDst : device.IPv6offsetDst+net.IPv6len]
+	} else {
+		data.Src = data.Packet[device.IPv4offsetSrc : device.IPv4offsetSrc+net.IPv4len]
+		data.Dst = data.Packet[device.IPv4offsetDst : device.IPv4offsetDst+net.IPv4len]
 	}
 }
 

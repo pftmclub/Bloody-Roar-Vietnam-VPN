@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -21,26 +22,33 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %v", err)
 	}
+	// Close the freshly created device if any later setup step fails, otherwise
+	// the TUN interface leaks.
+	success := false
+	defer func() {
+		if !success {
+			_ = tunDevice.Close()
+		}
+	}()
 	// Interface name must be utun[0-9]*
 	realIfname, err := tunDevice.Name()
 	if err != nil {
 		return nil, fmt.Errorf("get interface name: %v", err)
 	}
 
-	err = exec.Command("ifconfig", realIfname, "inet", ipNet.String(), localIP.String()).Run()
-	if err != nil {
-		return nil, fmt.Errorf("unable to setup interface mask: %v", err)
+	if out, err := exec.Command("ifconfig", realIfname, "inet", ipNet.String(), localIP.String()).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("unable to setup interface mask: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	ipNetMasked := &net.IPNet{
 		IP:   localIP.Mask(ipMask),
 		Mask: ipMask,
 	}
-	err = exec.Command("route", "-q", "-n", "add", "-inet", ipNetMasked.String(), "-iface", realIfname).Run()
-	if err != nil {
-		return nil, fmt.Errorf("unable to setup interface route: %v", err)
+	if out, err := exec.Command("route", "-q", "-n", "add", "-inet", ipNetMasked.String(), "-iface", realIfname).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("unable to setup interface route: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
+	success = true
 	return tunDevice, nil
 }
 

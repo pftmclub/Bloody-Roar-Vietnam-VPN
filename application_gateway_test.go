@@ -187,12 +187,17 @@ func TestGatewayPermissionDenied(t *testing.T) {
 	// Defence-in-depth on the exit-node side: silently flip WeAllow without
 	// going through the API (so the change does not propagate back to the
 	// client yet) and verify writeInboundBatch drops gateway-style packets.
+	// The hot-path permission check reads VpnPeer.weAllowUsingAsExitNode, an
+	// atomic kept in sync by RefreshPeersList; in production a settings change
+	// emits KnownPeerChanged which triggers it, so we call it directly here to
+	// mirror that local sync (the revocation still does not reach the client).
 	t.Run("DefenceInDepthDropsAtExitNode", func(t *testing.T) {
 		exitNode.app.Conf.Lock()
 		clientPeer := exitNode.app.Conf.KnownPeers[client.PeerID()]
 		clientPeer.WeAllowUsingAsExitNode = false
 		exitNode.app.Conf.KnownPeers[client.PeerID()] = clientPeer
 		exitNode.app.Conf.Unlock()
+		exitNode.app.Tunnel.RefreshPeersList()
 
 		captureInbound(exitNode, 10)
 
@@ -704,11 +709,12 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode.PeerID()))
 	checkClientBound(true)
 
-	// Idempotent: a second enable with the same peer must not double-apply.
-	// The route-state pointer must be reused.
-	routeStateBefore := client.app.VPNGateway.ClientRouteState()
+	// Idempotent: a second enable with the same peer must not double-apply —
+	// the OS-level install count must not grow.
+	netManager := client.app.NetManager.(*testNetManager)
+	enablesBefore := netManager.ClientEnables()
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode.PeerID()))
-	ts.Same(routeStateBefore, client.app.VPNGateway.ClientRouteState(), "route state must be reused on re-enable with same peer")
+	ts.Equal(enablesBefore, netManager.ClientEnables(), "routes must be reused on re-enable with same peer")
 	client.app.Conf.RLock()
 	ts.Equal(exitNode.PeerID(), client.app.Conf.VPNGateway.GatewayPeerID, "config still points to original peer")
 	client.app.Conf.RUnlock()
@@ -725,8 +731,8 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 
 	// Atomic switch to a second exit node: spin up a third peer, register
 	// it as a valid exit node for the client, then call EnableGateway with
-	// the new peer ID *while gateway is already on*. The route state
-	// pointer must survive (no teardown) and the tunnel/config bindings
+	// the new peer ID *while gateway is already on*. The installed routes
+	// must survive (no teardown/reinstall) and the tunnel/config bindings
 	// must rebind to the new peer.
 	exitNode2 := ts.NewTestPeer(true)
 	exitNode2.app.Tunnel.SetVPNGatewayServerEnabled(true)
@@ -736,9 +742,9 @@ func TestGatewayAPIRuntimeToggle(t *testing.T) {
 
 	grantExitNodePermission(ts, exitNode2, client)
 
-	routeStatePreSwitch := client.app.VPNGateway.ClientRouteState()
+	enablesPreSwitch := netManager.ClientEnables()
 	ts.NoError(client.api.EnableVPNGatewayClient(exitNode2.PeerID()))
-	ts.Same(routeStatePreSwitch, client.app.VPNGateway.ClientRouteState(), "atomic switch must not reinstall routes")
+	ts.Equal(enablesPreSwitch, netManager.ClientEnables(), "atomic switch must not reinstall routes")
 	client.app.Conf.RLock()
 	ts.Equal(exitNode2.PeerID(), client.app.Conf.VPNGateway.GatewayPeerID, "config must point to new exit node")
 	client.app.Conf.RUnlock()
@@ -986,6 +992,41 @@ func TestGatewayRebindOnPeerReadd(t *testing.T) {
 	client.tun.Outbound <- [][]byte{packet}
 	_, ok = recvPacketWithTimeout(exitInbound)
 	ts.True(ok, "gateway should flow again after the peer is re-added")
+}
+
+// TestGatewayPeerRemovalRefusedWhileActive verifies the API refuses to remove
+// the configured gateway peer while client mode is ACTIVE. Allowing the removal
+// would leave the OS routes/DNS installed with nothing bound and black-hole all
+// non-local traffic until restart, so RemovePeer returns 409 and the user must
+// disable the gateway first. The peer and its gateway binding stay intact.
+func TestGatewayPeerRemovalRefusedWhileActive(t *testing.T) {
+	skipIfVPNGatewayUnsupported(t)
+	ts := NewTestSuite(t)
+	client, exitNode, _ := setupGatewayPeers(ts)
+
+	// Enable via the API so VPNGateway applies (stubbed) routes + config.
+	ts.NoError(client.api.EnableVPNGatewayClient(exitNode.PeerID()))
+	ts.True(client.app.VPNGateway.IsClientActive(), "precondition: client routes installed")
+
+	// Removing the active gateway peer must be rejected.
+	err := client.api.RemovePeer(exitNode.PeerID())
+	ts.Error(err, "removing the active gateway peer must be refused")
+	ts.Contains(err.Error(), "disable VPN gateway")
+
+	// The peer is still known and the gateway is still active and persisted.
+	_, ok := client.app.Conf.GetPeer(exitNode.PeerID())
+	ts.True(ok, "the gateway peer must remain in KnownPeers after a refused removal")
+	ts.True(client.app.VPNGateway.IsClientActive(), "gateway client mode must stay active")
+	client.app.Conf.RLock()
+	ts.True(client.app.Conf.VPNGateway.ClientEnabled, "ClientEnabled must stay persisted")
+	client.app.Conf.RUnlock()
+
+	// After disabling the gateway, removal succeeds.
+	ts.NoError(client.api.DisableVPNGatewayClient())
+	ts.NoError(client.api.RemovePeer(exitNode.PeerID()),
+		"removal must succeed once the gateway is disabled")
+	_, ok = client.app.Conf.GetPeer(exitNode.PeerID())
+	ts.False(ok, "the peer must be gone after removal")
 }
 
 // TestGatewayListAvailableGatewaysFiltersToVPNGatewayOnly verifies that

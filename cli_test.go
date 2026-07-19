@@ -40,9 +40,8 @@ func TestCLI_Me(t *testing.T) {
 		require.NoError(t, err)
 		// Row labels are static; values are dynamic (uptime, bootstrap peers, reachability)
 		for _, label := range []string{
-			"Download rate", "Upload rate", "Bootstrap peers",
-			"DNS", "SOCKS5 Proxy", "SOCKS5 Proxy address",
-			"SOCKS5 Proxy exit node",
+			"Name", "Download rate", "Upload rate", "Bootstrap peers",
+			"VPN", "DNS", "SOCKS5 Proxy",
 			"VPN gateway client", "VPN gateway server",
 			"Reachability", "Uptime", "Server version",
 		} {
@@ -388,11 +387,11 @@ func TestCLI_Gateway(t *testing.T) {
 	t.Run("StatusEnabled", func(t *testing.T) {
 		out, err := runCLI(ts, client, "gateway", "status")
 		require.NoError(t, err)
-		require.Contains(t, out, "VPN gateway client enabled: true")
+		require.Regexp(t, `Client:\s+enabled`, out)
+		require.Regexp(t, `Server:\s+disabled`, out)
 		require.Contains(t, out, "Gateway peer:")
 		require.Contains(t, out, exitNode.PeerID())
-		require.Contains(t, out, "Gateway via relay:")
-		require.Contains(t, out, "VPN gateway server enabled: false")
+		require.Regexp(t, `Connection:\s+(direct|via relay)`, out)
 	})
 
 	t.Run("List", func(t *testing.T) {
@@ -428,9 +427,11 @@ func TestCLI_Gateway(t *testing.T) {
 		statusOut, err := runCLI(ts, client, "me", "status")
 		require.NoError(t, err)
 		require.Contains(t, statusOut, "VPN gateway client")
-		require.Contains(t, statusOut, "via ")
+		require.Contains(t, statusOut, "peer_2")
 		require.Contains(t, statusOut, "[connected]")
-		require.Contains(t, statusOut, "VPN gateway via relay")
+		// The gateway detail row shows the connection path once connected.
+		require.True(t, strings.Contains(statusOut, "direct") || strings.Contains(statusOut, "via relay"),
+			"gateway detail row should show connection path")
 	})
 
 	t.Run("ServerDisable", func(t *testing.T) {

@@ -165,23 +165,29 @@ func (r *Resolver) dnsLocalDomainHandler(resp dns.ResponseWriter, req *dns.Msg) 
 		mappedIP, found := cfg.directMapping[hostnameLower]
 
 		switch qtype {
-		case dns.TypeA, dns.TypeAAAA, dns.TypeANY:
-			aRec := &dns.A{
-				Hdr: dns.RR_Header{
-					// we should return original name from the request as some clients expect that
-					Name:   hostname,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET,
-					Ttl:    defaultTTLSeconds,
-				},
-			}
-			if found {
-				// TODO: support ipv6
-				aRec.A = net.ParseIP(mappedIP).To4()
-			} else {
+		case dns.TypeA, dns.TypeANY:
+			if !found {
 				m.SetRcode(req, dns.RcodeNameError)
+				continue
 			}
-			m.Answer = append(m.Answer, aRec)
+			if ip := net.ParseIP(mappedIP).To4(); ip != nil {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{
+						// we should return original name from the request as some clients expect that
+						Name:   hostname,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    defaultTTLSeconds,
+					},
+					A: ip,
+				})
+			}
+		case dns.TypeAAAA:
+			if !found {
+				m.SetRcode(req, dns.RcodeNameError)
+				continue
+			}
+			// TODO: support IPv6 addresses in cfg.directMapping.
 		}
 	}
 

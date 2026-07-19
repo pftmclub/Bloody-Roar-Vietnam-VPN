@@ -280,6 +280,7 @@ func (h *Handler) GetAuthRequests(c echo.Context) (err error) {
 // @Success	200		"OK"
 // @Failure	400		{object}	api.Error
 // @Failure	404		{object}	api.Error
+// @Failure	409		{object}	api.Error
 // @Router		/peers/remove [POST]
 func (h *Handler) RemovePeer(c echo.Context) (err error) {
 	req := entity.PeerIDRequest{}
@@ -294,6 +295,18 @@ func (h *Handler) RemovePeer(c echo.Context) (err error) {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest,
 			ErrorMessage("Invalid hex-encoded multihash representing of a peer ID"))
+	}
+
+	// Refuse to remove the peer while it is the active VPN gateway: doing so
+	// would leave the TUN default route / DNS installed with nothing bound and
+	// black-hole all non-local traffic. The user must disable gateway client
+	// mode first (an explicit, reversible action).
+	h.conf.RLock()
+	isActiveGateway := h.conf.VPNGateway.ClientEnabled && h.conf.VPNGateway.GatewayPeerID == req.PeerID
+	h.conf.RUnlock()
+	if isActiveGateway {
+		return c.JSON(http.StatusConflict,
+			ErrorMessage("disable VPN gateway before removing this peer"))
 	}
 
 	knownPeer, exists := h.conf.RemovePeer(req.PeerID)

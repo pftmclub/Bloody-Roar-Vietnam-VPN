@@ -16,6 +16,14 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %v", err)
 	}
+	// Close the freshly created device if any later setup step fails, otherwise
+	// the TUN interface leaks.
+	success := false
+	defer func() {
+		if !success {
+			_ = tunDevice.Close()
+		}
+	}()
 
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
@@ -36,6 +44,7 @@ func newTUN(ifname string, mtu int, localIP net.IP, ipMask net.IPMask) (tun.Devi
 		return nil, fmt.Errorf("unable to UP interface: %v", err)
 	}
 
+	success = true
 	return tunDevice, nil
 }
 

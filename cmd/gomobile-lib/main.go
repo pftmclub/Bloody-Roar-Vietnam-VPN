@@ -13,7 +13,7 @@ import (
 	"github.com/anywherelan/awl"
 	"github.com/anywherelan/awl/config"
 	"github.com/anywherelan/awl/vpn"
-	"github.com/anywherelan/awl/vpn/sockmark"
+	"github.com/anywherelan/awl/vpn/netstate"
 )
 
 const appType = config.AppTypeAwlAndroid
@@ -64,7 +64,7 @@ type SocketProtector interface {
 
 // StartServerWithProtector starts the server, registering a socket protector
 // so that libp2p and other sockets bypass the VPN. The protector reference is held by
-// the Application's sockmark.Marker for the lifetime of the run; calling
+// the Application's netstate manager for the lifetime of the run; calling
 // StopServer drops it.
 //
 // When VPN gateway client mode is enabled in the saved config, the host app
@@ -80,7 +80,7 @@ func StartServer(tunFD int32, protector SocketProtector) (err error) {
 
 	globalApp = awl.New()
 	globalApp.SetupLoggerAndConfig(appType)
-	globalApp.SockMarker = sockmark.NewAndroid(protectorToFunc(protector))
+	globalApp.NetManager = netstate.NewAndroidManager(protectorToFunc(protector))
 
 	// A tunFD of 0 means the host did not establish a VPN interface (VPN
 	// disabled in config); Init then skips the VPN device entirely. Otherwise
@@ -132,7 +132,7 @@ func UpdateTunDevice(tunFD int32) error {
 	return globalSwapTUN.Swap(inner)
 }
 
-func protectorToFunc(p SocketProtector) sockmark.ProtectFunc {
+func protectorToFunc(p SocketProtector) netstate.ProtectFunc {
 	if p == nil {
 		return nil
 	}

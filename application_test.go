@@ -405,6 +405,16 @@ func TestSOCKS5ProxyFallbackToOldProtocol(t *testing.T) {
 	// Remove new protocol handler from peer2 to simulate old peer
 	peer2.app.P2p.Host().RemoveStreamHandler(protocol.Socks5NoAuthMethod)
 
+	// Wait until peer1's peerstore reflects the removal (identify-push). Otherwise
+	// NewStreamMulti optimistically negotiates the stale /socks5-noauth/ against a
+	// peer that no longer handles it, and the dial fails with EOF.
+	ts.Eventually(func() bool {
+		supported, err := peer1.app.P2p.Host().Peerstore().
+			SupportsProtocols(peer2.app.P2p.PeerID(), protocol.Socks5NoAuthMethod)
+		ts.NoError(err)
+		return len(supported) == 0
+	}, 15*time.Second, 100*time.Millisecond)
+
 	// Allow peer1 to use peer2 as exit node
 	peer1Config, err := peer2.api.KnownPeerConfig(peer1.PeerID())
 	ts.NoError(err)

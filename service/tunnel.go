@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/anywherelan/awl/awlevent"
 	"github.com/anywherelan/awl/config"
 	"github.com/anywherelan/awl/metrics"
 	"github.com/anywherelan/awl/protocol"
@@ -44,12 +45,24 @@ type Tunnel struct {
 	vpnGatewayServerEnabled bool     // server side: we serve as a VPN gateway for others
 	// awlSubnet is set once in NewTunnel and never mutated afterwards.
 	awlSubnet *net.IPNet
+
+	// gatewayConnEmitter emits awlevent.VPNGatewayConnectivityChanged. May be
+	// nil if the event bus had no emitter. vpnGatewayConnected holds the last
+	// emitted connectivity state so onPeerConnected/onPeerDisconnected only fire
+	// on real transitions (they run on every libp2p per-stream event).
+	gatewayConnEmitter  awlevent.Emitter
+	vpnGatewayConnected atomic.Bool
 }
 
-func NewTunnel(p2pService P2p, device *vpn.Device, conf *config.Config) *Tunnel {
+func NewTunnel(p2pService P2p, device *vpn.Device, conf *config.Config, eventbus awlevent.Bus) *Tunnel {
 	localIP, netMask := conf.VPNLocalIPMask()
 	awlSubnet := &net.IPNet{IP: localIP, Mask: netMask}
 	udpBroadcastAddr := vpn.GetIPv4BroadcastAddress(awlSubnet)
+
+	emitter, err := eventbus.Emitter(new(awlevent.VPNGatewayConnectivityChanged))
+	if err != nil {
+		panic(err)
+	}
 
 	tunnel := &Tunnel{
 		p2p:                     p2pService,
@@ -61,6 +74,7 @@ func NewTunnel(p2pService P2p, device *vpn.Device, conf *config.Config) *Tunnel 
 		udpBroadcastAddr:        udpBroadcastAddr,
 		vpnGatewayServerEnabled: conf.VPNGateway.ServerEnabled,
 		awlSubnet:               awlSubnet,
+		gatewayConnEmitter:      emitter,
 	}
 	tunnel.RefreshPeersList()
 	p2pService.SubscribeConnectionEvents(tunnel.onPeerConnected, tunnel.onPeerDisconnected)
@@ -188,6 +202,7 @@ func (t *Tunnel) RefreshPeersList() {
 			t.vpnGatewayClientEnabled = false
 			t.vpnGatewayPeerID = ""
 			t.vpnGatewayPeer = nil
+			t.vpnGatewayConnected.Store(false)
 		} else {
 			t.vpnGatewayPeer = gwPeer
 		}
@@ -505,7 +520,7 @@ func (vp *VpnPeer) backgroundInboundHandler(t *Tunnel) {
 		filteredPackets := packetsBatch[:newLen]
 
 		if len(filteredPackets) > 0 {
-			err := t.writeInboundBatch(filteredPackets, bytesBufs, localIP, vp.peerID)
+			err := t.writeInboundBatch(filteredPackets, bytesBufs, localIP, vp)
 			if err != nil {
 				t.logger.Warnf("write packets batch to vpn for local ip %s: %v", localIP, err)
 			} else {
@@ -580,6 +595,15 @@ func (t *Tunnel) SetVPNGatewayPeer(gatewayPeerID peer.ID) error {
 	t.conf.SaveLocked()
 	t.conf.Unlock()
 
+	// Seed connectivity from the current state and emit it, so the UI gets an
+	// immediate signal for the common case where the peer is not connected
+	// when the gateway is enabled.
+	connected := t.p2p.IsConnected(gatewayPeerID)
+	t.vpnGatewayConnected.Store(connected)
+	if !connected {
+		t.emitGatewayConnectivity(connected, gatewayPeerID)
+	}
+
 	return nil
 }
 
@@ -591,6 +615,7 @@ func (t *Tunnel) ClearVPNGatewayPeer() {
 	t.vpnGatewayClientEnabled = false
 	t.vpnGatewayPeerID = ""
 	t.vpnGatewayPeer = nil
+	t.vpnGatewayConnected.Store(false)
 
 	t.conf.Lock()
 	t.conf.VPNGateway.ClientEnabled = false
@@ -607,7 +632,12 @@ func (t *Tunnel) onPeerConnected(_ network.Network, conn network.Conn) {
 	if !enabled || gatewayPeerID == "" || conn.RemotePeer() != gatewayPeerID {
 		return
 	}
-	t.logger.Infof("VPN gateway peer %s connected", gatewayPeerID)
+	// libp2p fires this per connection; dedup so we emit only on the
+	// disconnected -> connected transition.
+	if t.vpnGatewayConnected.CompareAndSwap(false, true) {
+		t.logger.Infof("VPN gateway peer %s connected", gatewayPeerID)
+		t.emitGatewayConnectivity(true, gatewayPeerID)
+	}
 }
 
 func (t *Tunnel) onPeerDisconnected(_ network.Network, conn network.Conn) {
@@ -624,8 +654,23 @@ func (t *Tunnel) onPeerDisconnected(_ network.Network, conn network.Conn) {
 	if t.p2p.IsConnected(gatewayPeerID) {
 		return
 	}
-	t.logger.Warnf("VPN gateway peer %s disconnected", gatewayPeerID)
-	// TODO: emit an awlevent so the UI can show the VPN gateway peer is down
+	if t.vpnGatewayConnected.CompareAndSwap(true, false) {
+		t.logger.Warnf("VPN gateway peer %s disconnected", gatewayPeerID)
+		t.emitGatewayConnectivity(false, gatewayPeerID)
+	}
+}
+
+// emitGatewayConnectivity publishes a VPNGatewayConnectivityChanged edge event.
+// Best-effort: emit errors are non-fatal (GatewayInfo polling remains the
+// canonical source of truth).
+func (t *Tunnel) emitGatewayConnectivity(connected bool, gatewayPeerID peer.ID) {
+	if t.gatewayConnEmitter == nil {
+		return
+	}
+	_ = t.gatewayConnEmitter.Emit(awlevent.VPNGatewayConnectivityChanged{
+		Connected: connected,
+		PeerID:    gatewayPeerID.String(),
+	})
 }
 
 // writeInboundBatch rewrites IP headers per packet and writes the whole batch
@@ -649,29 +694,15 @@ func (t *Tunnel) onPeerDisconnected(_ network.Network, conn network.Conn) {
 // awl subnet inspection is intentionally absent here. The on-wire tag carries
 // the sender's intent explicitly, so this side does not need to re-derive it
 // from packet IPs and is not exposed to a subnet mismatch between peers.
-func (t *Tunnel) writeInboundBatch(packets []*vpn.Packet, bufs [][]byte, senderIP net.IP, remotePeerID peer.ID) error {
+func (t *Tunnel) writeInboundBatch(packets []*vpn.Packet, bufs [][]byte, senderIP net.IP, vp *VpnPeer) error {
 	t.peersLock.RLock()
 	serverEnabled := t.vpnGatewayServerEnabled
-	isOurGateway := t.vpnGatewayClientEnabled && remotePeerID == t.vpnGatewayPeerID
+	isOurGateway := t.vpnGatewayClientEnabled && vp.peerID == t.vpnGatewayPeerID
 	t.peersLock.RUnlock()
 
 	localIP := t.device.LocalIP()
 
-	// Lazy permission check: only resolved if we actually see a Forward
-	// packet, so the common case (no gateway role active) skips the
-	// peer.ID.String() allocation and the conf RLock.
-	var allowGateway, permResolved bool
-	isGatewayAllowed := func() bool {
-		if permResolved {
-			return allowGateway
-		}
-		// TODO: store this info in atomic in VpnPeer and update in RefreshPeersList
-		//  this will eliminate lock usage on every packets batch
-		kp, ok := t.conf.GetPeer(remotePeerID.String())
-		allowGateway = ok && kp.WeAllowUsingAsExitNode
-		permResolved = true
-		return allowGateway
-	}
+	allowGateway := vp.weAllowUsingAsExitNode.Load()
 
 	for _, packet := range packets {
 		if packet.IsIPv6 {
@@ -685,7 +716,7 @@ func (t *Tunnel) writeInboundBatch(packets []*vpn.Packet, bufs [][]byte, senderI
 				metrics.VPNPacketsDroppedTotal.WithLabelValues("gateway_server_disabled").Inc()
 				continue
 			}
-			if !isGatewayAllowed() {
+			if !allowGateway {
 				metrics.VPNPacketsDroppedTotal.WithLabelValues("gateway_not_allowed").Inc()
 				continue
 			}
@@ -710,6 +741,12 @@ func (t *Tunnel) writeInboundBatch(packets []*vpn.Packet, bufs [][]byte, senderI
 }
 
 // isNonRoutableIP returns true for IPs that should not be forwarded through the gateway.
+//
+// TODO(gateway): add client-side drop of
+// private destinations (10/8, 172.16/12, 192.168/16, CGNAT, link-local)
+// before sending to the gateway: fast local refusal instead of a silent drop
+// at the exit node's filter. Not a replacement for the server-side filtering
+// (iptables on Linux, WFP on Windows) — the server cannot trust clients.
 func isNonRoutableIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
 }
